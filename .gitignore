@@ -1,0 +1,5 @@
+datasets/
+weights/
+__pycache__/
+*.json
+*.sh
