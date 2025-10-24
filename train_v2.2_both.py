@@ -480,7 +480,7 @@ def train():
                 best_val_loss = avg_val_loss
                 if best_model_path_for_val is not None and os.path.exists(best_model_path_for_val):
                     os.rename(best_model_path_for_val, model_save_path_second_best)
-                    print(f"Model {os.path.basename(best_model_path_for_eval)} promoted to 2nd best.")
+                    print(f"Model {os.path.basename(best_model_path_for_val)} promoted to 2nd best.")
                     second_best_model_path_for_val = model_save_path_second_best
                 torch.save(ddp_model.module.state_dict(), model_save_path_best)
                 best_model_path_for_val = model_save_path_best
