@@ -56,9 +56,9 @@ class ConfigV2:
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
+    BATCH_SIZE = 16 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 4
+    ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
