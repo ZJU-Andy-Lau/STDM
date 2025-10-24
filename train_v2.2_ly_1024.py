@@ -350,7 +350,7 @@ def train():
     
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=False)
 
-    optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE * world_size, weight_decay=1e-4)
+    optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
     criterion = nn.MSELoss()
     scaler = amp.GradScaler()
 
