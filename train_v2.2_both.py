@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -559,7 +561,7 @@ def train():
     if rank == 0:
         print("\n" + "="*50 + "\nTraining finished. Starting evaluation on the test set...\n" + "="*50 + "\n")
     
-    path_list_to_eval = [best_model_path_for_eval, second_best_model_path_for_eval,best_model_path_for_val,second_best_model_path_for_val] if rank == 0 else [None, None]
+    path_list_to_eval = [best_model_path_for_eval, second_best_model_path_for_eval,best_model_path_for_val,second_best_model_path_for_val] if rank == 0 else [None, None, None, None]
     dist.broadcast_object_list(path_list_to_eval, src=0)
 
     best_model_path_synced, second_best_model_path_synced, best_model_path_for_val_synced, second_best_model_path_for_val_synced = path_list_to_eval
