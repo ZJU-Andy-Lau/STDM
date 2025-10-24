@@ -303,8 +303,8 @@ def train():
 
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
 
-    train_features = np.load(cfg.TRAIN_FEATURES_PATH)[0:48]
-    val_features = np.load(cfg.VAL_FEATURES_PATH)[0:48]
+    train_features = np.load(cfg.TRAIN_FEATURES_PATH)
+    val_features = np.load(cfg.VAL_FEATURES_PATH)
     
     train_dataset = EVChargerDatasetV2(train_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -734,7 +734,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
     print("Model loaded successfully.")
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-    test_features = np.load(cfg.TEST_FEATURES_PATH)[0:24]
+    test_features = np.load(cfg.TEST_FEATURES_PATH)
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
