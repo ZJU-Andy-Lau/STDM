@@ -412,7 +412,7 @@ def train():
             tensors = [d.to(device_id) for d in (history_c, static_c, future_x0, future_known_c)]
             history_c, static_c, future_x0, future_known_c = tensors
             
-            with amp.autocast(device_type='cuda', dtype=torch.float16):
+            with amp.autocast():
                 b = future_x0.shape[0]
                 history_c_p = history_c.permute(0, 2, 1, 3)
                 future_x0_p = future_x0.permute(0, 2, 1, 3)
@@ -447,7 +447,7 @@ def train():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors]
                 
-                with amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                with amp.autocast():
                     b = future_x0.shape[0]
                     history_c_p = history_c.permute(0, 2, 1, 3)
                     future_x0_p = future_x0.permute(0, 2, 1, 3)
@@ -760,7 +760,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     all_predictions_list, all_samples_list, all_true_list = [], [], []
 
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
-    with torch.no_grad(), amp.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+    with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
             history_c, static_c, future_x0_true, future_known_c = [d.to(cfg.DEVICE) for d in tensors]
             all_true_list.append(future_x0_true.permute(0, 2, 1, 3).cpu().numpy())
