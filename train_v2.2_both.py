@@ -301,8 +301,8 @@ def train():
 
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
 
-    train_features = np.load(cfg.TRAIN_FEATURES_PATH)
-    val_features = np.load(cfg.VAL_FEATURES_PATH)
+    train_features = np.load(cfg.TRAIN_FEATURES_PATH)[0:48]
+    val_features = np.load(cfg.VAL_FEATURES_PATH)[0:48]
     
     train_dataset = EVChargerDatasetV2(train_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -732,7 +732,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
     print("Model loaded successfully.")
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-    test_features = np.load(cfg.TEST_FEATURES_PATH)
+    test_features = np.load(cfg.TEST_FEATURES_PATH)[0:24]
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
@@ -783,8 +783,8 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
             all_predictions_list.append(denorm_pred)
             all_samples_list.append(denorm_samples)
 
-    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
-    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
+    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)[:y_true_original.shape[0]]
+    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)[:y_true_original.shape[0]]
 
     np.save(f'./results/pred_{cfg.RUN_ID}.npy', all_predictions)
     np.save(f'./results/samples_{cfg.RUN_ID}.npy', all_samples)
@@ -798,6 +798,11 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
     except FileNotFoundError:
         print("\nBaseline predictions file not found. Skipping significance test.")
         perform_significance = False
+
+    print(f"y_true shape:{y_true_original.shape}")
+    print(f"all_predictions shape:{all_predictions.shape}")
+    print(f"all_samples shape:{all_samples.shape}")
+    print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
 
     final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
     if perform_significance:
