@@ -13,10 +13,10 @@ class GCN_GAT_Layer(nn.Module):
     def __init__(self, in_channels, out_channels, heads=4, dropout=0.1, concat=True):
         super(GCN_GAT_Layer, self).__init__()
         self.gcn = GCNConv(in_channels, out_channels)
-        # self.gat = GATConv(in_channels, out_channels, heads=heads, dropout=dropout, concat=concat)
+        self.gat = GATConv(in_channels, out_channels, heads=heads, dropout=dropout, concat=concat)
 
-        # fusion_dim = out_channels + (out_channels * heads if concat else out_channels)
-        # self.fusion = nn.Linear(fusion_dim, out_channels)
+        fusion_dim = out_channels + (out_channels * heads if concat else out_channels)
+        self.fusion = nn.Linear(fusion_dim, out_channels)
 
         self.dropout = nn.Dropout(dropout)
         self.act = nn.ELU()
@@ -27,12 +27,12 @@ class GCN_GAT_Layer(nn.Module):
         edge_index: (2, E)
         """
         x_gcn = self.gcn(x, edge_index, edge_weight=edge_weight)
-        # x_gat = self.gat(x, edge_index)
+        x_gat = self.gat(x, edge_index)
 
-        # x_cat = torch.cat([x_gcn, x_gat], dim=-1)
-        # out = self.fusion(x_cat)
-        # return self.act(self.dropout(out))
-        return self.act(self.dropout(x_gcn))
+        x_cat = torch.cat([x_gcn, x_gat], dim=-1)
+        out = self.fusion(x_cat)
+        return self.act(self.dropout(out))
+        # return self.act(self.dropout(x_gcn))
 
 
 class SinusoidalPosEmb(nn.Module):
