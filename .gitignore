@@ -1,5 +1,7 @@
 datasets/
 weights/
 __pycache__/
+results/
+urbanev/
 *.json
 *.sh
