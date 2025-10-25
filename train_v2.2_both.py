@@ -81,7 +81,7 @@ class ConfigV2:
 
     # 数据文件路径
     TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
-    VAL_FEATURES_PATH = './urbanev/features_valid_v2.npy'
+    VAL_FEATURES_PATH = './urbanev/features_test_v2.npy' # 暂时尝试将测试集作为验证集
     TEST_FEATURES_PATH = './urbanev/features_test_v2.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
@@ -566,75 +566,105 @@ def train():
 
     best_model_path_synced, second_best_model_path_synced, best_model_path_for_val_synced, second_best_model_path_for_val_synced = path_list_to_eval
 
-    my_results = None
-    if rank == 0:
-        if best_model_path_synced:
-            print(f"\n[GPU {device_id}] Evaluating MAE BEST model: {os.path.basename(best_model_path_synced)}")
-            my_results = evaluate_model(cfg, best_model_path_synced, scaler_save_path, device=f"cuda:{device_id}")
-            print(f"[GPU {device_id}] Finished evaluating MAE BEST model.")
-        else:
-            print("No mae best model was saved. Skipping evaluation.")
+    metrics_best = None
+    metrics_second_best = None
+    metrics_best_val = None
+    metrics_second_best_val = None
+
+    # 1. --- 所有卡并行评估 BEST model ---
+    if best_model_path_synced:
+        if rank == 0:
+            print(f"\n[ALL GPUS] Evaluating BEST model (in parallel): {os.path.basename(best_model_path_synced)}")
+        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
+        metrics_best = evaluate_model(
+            cfg, best_model_path_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating BEST model.")
+            print(f"===== [FINAL RESULT 1/4] BEST Model ({os.path.basename(best_model_path_synced)}) =====")
+            print_metrics(metrics_best)
+    else:
+        if rank == 0:
+            print("No best model was saved. Skipping evaluation.")
             
-    if world_size > 1 and rank == 1:
-        if second_best_model_path_synced:
-            print(f"\n[GPU {device_id}] Evaluating MAE 2ND BEST model: {os.path.basename(second_best_model_path_synced)}")
-            my_results = evaluate_model(cfg, second_best_model_path_synced, scaler_save_path, device=f"cuda:{device_id}")
-            print(f"[GPU {device_id}] Finished evaluating MAE 2ND BEST model.")
-        else:
-            print(f"[GPU {device_id}] No mae second best model was saved. Skipping evaluation.")
+    # 2. --- 所有卡并行评估 2ND BEST model ---
+    if second_best_model_path_synced:
+        if rank == 0:
+             print(f"\n[ALL GPUS] Evaluating 2ND BEST model (in parallel): {os.path.basename(second_best_model_path_synced)}")
+        # 所有进程再次调用 evaluate_model
+        metrics_second_best = evaluate_model(
+            cfg, second_best_model_path_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating 2ND BEST model.")
+            print(f"\n===== [FINAL RESULT 2/4] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
+            print_metrics(metrics_second_best)
+    else:
+        if rank == 0:
+            print(f"[ALL GPUS] No second best model was saved. Skipping evaluation.")
 
-    if world_size > 2 and rank == 2:
-        if best_model_path_for_val_synced:
-            print(f"\n[GPU {device_id}] Evaluating BEST model: {os.path.basename(best_model_path_for_val_synced)}")
-            my_results = evaluate_model(cfg, best_model_path_for_val_synced, scaler_save_path, device=f"cuda:{device_id}")
-            print(f"[GPU {device_id}] Finished evaluating BEST model.")
-        else:
-            print(f"[GPU {device_id}] No best model was saved. Skipping evaluation.")
-    
-    if world_size > 3 and rank == 3:
-        if second_best_model_path_for_val_synced:
-            print(f"\n[GPU {device_id}] Evaluating BEST model: {os.path.basename(second_best_model_path_for_val_synced)}")
-            my_results = evaluate_model(cfg, second_best_model_path_for_val_synced, scaler_save_path, device=f"cuda:{device_id}")
-            print(f"[GPU {device_id}] Finished evaluating second BEST model.")
-        else:
-            print(f"[GPU {device_id}] No second best model was saved. Skipping evaluation.")
-
-    if world_size == 1 and rank == 0:
-        print("\nOnly one GPU detected. Second best model will not be evaluated separately.")
-
-    gathered_results = [None] * world_size
-    dist.gather_object(
-        my_results,
-        gathered_results if rank == 0 else None,
-        dst=0
-    )
+    # 3. --- 所有卡并行评估 BEST VAL model ---
+    if best_model_path_for_val_synced:
+        if rank == 0:
+            print(f"\n[ALL GPUS] Evaluating BEST VAL model (in parallel): {os.path.basename(best_model_path_for_val_synced)}")
+        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
+        metrics_best_val = evaluate_model(
+            cfg, best_model_path_for_val_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best_val'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating BEST VAL model.")
+            print(f"===== [FINAL RESULT 3/4] BEST VAL Model ({os.path.basename(best_model_path_for_val_synced)}) =====")
+            print_metrics(metrics_best_val)
+    else:
+        if rank == 0:
+            print("No best val model was saved. Skipping evaluation.")
+            
+    # 4. --- 所有卡并行评估 2ND BEST VAL model ---
+    if second_best_model_path_for_val_synced:
+        if rank == 0:
+             print(f"\n[ALL GPUS] Evaluating 2ND BEST VAL model (in parallel): {os.path.basename(second_best_model_path_for_val_synced)}")
+        # 所有进程再次调用 evaluate_model
+        metrics_second_best_val = evaluate_model(
+            cfg, second_best_model_path_for_val_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best_val'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating 2ND BEST VAL model.")
+            print(f"\n===== [FINAL RESULT 4/4] 2ND BEST VAL Model ({os.path.basename(second_best_model_path_for_val_synced)}) =====")
+            print_metrics(metrics_second_best_val)
+    else:
+        if rank == 0:
+            print(f"[ALL GPUS] No second best val model was saved. Skipping evaluation.")
 
     if rank == 0:
         print("\n" + "="*50 + "\nSequential Evaluation Results\n" + "="*50 + "\n")
         
-        if gathered_results[0]:
-            print(f"===== [FINAL RESULT 1/2] BEST Model ({os.path.basename(best_model_path_synced)}) =====")
-            print_metrics(gathered_results[0])
+        if metrics_best:
+            print(f"===== [FINAL RESULT 1/4] BEST Model ({os.path.basename(best_model_path_synced)}) =====")
+            print_metrics(metrics_best)
         else:
-            print("===== [FINAL RESULT 1/2] BEST Model: SKIPPED (not saved or error) =====")
+            print("===== [FINAL RESULT 1/4] BEST Model: SKIPPED (not saved or error) =====")
             
-        if world_size > 1 and len(gathered_results) > 1 and gathered_results[1]:
-            print(f"\n===== [FINAL RESULT 2/2] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
-            print_metrics(gathered_results[1])
+        if metrics_second_best:
+            print(f"\n===== [FINAL RESULT 2/4] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
+            print_metrics(metrics_second_best)
         else:
-            print("\n===== [FINAL RESULT 2/2] 2ND BEST Model: SKIPPED (not enough GPUs, not saved, or error) =====")
-
-        if world_size > 2 and len(gathered_results) > 2 and gathered_results[2]:
-            print(f"\n===== [FINAL RESULT 1/2] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
-            print_metrics(gathered_results[2])
+            print("\n===== [FINAL RESULT 2/4] 2ND BEST Model: SKIPPED (not saved or error) =====")
+        
+        if metrics_best_val:
+            print(f"===== [FINAL RESULT 3/4] BEST VAL Model ({os.path.basename(best_model_path_for_val_synced)}) =====")
+            print_metrics(metrics_best_val)
         else:
-            print("\n===== [FINAL RESULT 1/2] 2ND BEST Model: SKIPPED (not enough GPUs, not saved, or error) =====")
-
-        if world_size > 3 and len(gathered_results) > 3 and gathered_results[3]:
-            print(f"\n===== [FINAL RESULT 2/2] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
-            print_metrics(gathered_results[3])
+            print("===== [FINAL RESULT 3/4] BEST VAL Model: SKIPPED (not saved or error) =====")
+            
+        if metrics_second_best_val:
+            print(f"\n===== [FINAL RESULT 4/4] 2ND BEST VAL Model ({os.path.basename(second_best_model_path_for_val_synced)}) =====")
+            print_metrics(metrics_second_best_val)
         else:
-            print("\n===== [FINAL RESULT 2/2] 2ND BEST Model: SKIPPED (not enough GPUs, not saved, or error) =====")
+            print("\n===== [FINAL RESULT 4/4] 2ND BEST VAL Model: SKIPPED (not saved or error) =====")
 
     dist.destroy_process_group()
 
