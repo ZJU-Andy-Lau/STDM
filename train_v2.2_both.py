@@ -57,14 +57,14 @@ class ConfigV2:
     T = 1000
     
     # 训练参数
-    EPOCHS = 10
+    EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
     ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
-    COOLDOWN_EPOCHS = 5    # 退火阶段的 Epoch 数量
-    CYCLE_EPOCHS = 10      # 每个余弦退火周期的 Epoch 数量 (T_0)
+    COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
+    CYCLE_EPOCHS = 10    # 每个余弦退火周期的 Epoch 数量 (T_0)
     
     # --- 核心修改1: 修改文件路径模板以保存最佳和次佳模型 ---
     MODEL_SAVE_PATH_TEMPLATE = "./weights/st_diffusion_model_v2_{run_id}_{rank}.pth"
@@ -73,11 +73,11 @@ class ConfigV2:
     # --- 周期性 MAE 评估的配置 ---
     EVAL_ON_VAL = True               # 是否开启周期性 MAE 评估
     EVAL_ON_VAL_EPOCH = 5            # 每 5 个 epoch 运行一次
-    EVAL_ON_VAL_BATCHES = 1         # 使用 50 个 batch 进行评估 (50 * BATCH_SIZE=200 个样本)
+    EVAL_ON_VAL_BATCHES = 50         # 使用 50 个 batch 进行评估 (50 * BATCH_SIZE=200 个样本)
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
-    EVAL_ON_VAL_STEPS = 50           # 评估时使用 50 步采样 (为了速度)
+    EVAL_ON_VAL_STEPS = 20           # 评估时使用 20 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
-    EVAL_SEED = 42  
+    EVAL_SEED = 42 
 
     # 数据文件路径
     TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
@@ -303,8 +303,8 @@ def train():
 
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
 
-    train_features = np.load(cfg.TRAIN_FEATURES_PATH)[0:48]
-    val_features = np.load(cfg.VAL_FEATURES_PATH)[0:48]
+    train_features = np.load(cfg.TRAIN_FEATURES_PATH)
+    val_features = np.load(cfg.VAL_FEATURES_PATH)
     
     train_dataset = EVChargerDatasetV2(train_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -766,7 +766,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     print("Model loaded successfully.")
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-    test_features = np.load(cfg.TEST_FEATURES_PATH)[:24]
+    test_features = np.load(cfg.TEST_FEATURES_PATH)
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
