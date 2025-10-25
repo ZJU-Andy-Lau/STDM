@@ -747,11 +747,13 @@ def dm_test(e1, e2, h=12, crit="MAD"):
     p_value = 1 - t.cdf(dm_stat, df=n-1)
     return dm_stat, p_value
 
-def evaluate_model(train_cfg, model_path, scaler_path, device):
+def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,key):
     cfg = EvalConfig()
     cfg.RUN_ID = train_cfg.RUN_ID
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
     cfg.DEVICE = device
+
+    set_seed(cfg.EVAL_SEED)
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
@@ -764,7 +766,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
     print("Model loaded successfully.")
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-    test_features = np.load(cfg.TEST_FEATURES_PATH)[:24]
+    test_features = np.load(cfg.TEST_FEATURES_PATH)
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
@@ -777,21 +779,24 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
     
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
     test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler=scaler)
-    test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False)
+    # --- 使用 DistributedSampler 切分测试集 ---
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
-    original_test_samples = create_sliding_windows(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
-    y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_test_samples]).squeeze(-1)
+    # original_test_samples = create_sliding_windows(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
+    # y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_test_samples]).squeeze(-1)
 
-    all_predictions_list, all_samples_list = [], []
+    all_predictions_list, all_samples_list, all_true_list = [], [], []
 
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
             history_c, static_c, future_x0_true, future_known_c = [d.to(cfg.DEVICE) for d in tensors]
+            all_true_list.append(future_x0_true.permute(0, 2, 1, 3).cpu().numpy())
 
             b = history_c.shape[0]
             len_list = calc_layer_lengths(cfg.PRED_LEN, cfg.DEPTH)
-            edge_data = [batch_time_edge_index(original_edge_index, original_edge_weights, cfg.NUM_NODES, b, len_list[d], cfg.DEVICE) for d in range(cfg.DEPTH + 1)]
+            edge_data = [batch_time_edge_index(original_edge_index.to(device), original_edge_weights.to(device), cfg.NUM_NODES, b, len_list[d], cfg.DEVICE) for d in range(cfg.DEPTH + 1)]
 
             generated_samples = []
             for _ in range(cfg.NUM_SAMPLES):
@@ -800,7 +805,8 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
                     future_known_c=future_known_c.permute(0, 2, 1, 3),
                     history_edge_data=edge_data,
                     future_edge_data=edge_data,
-                    shape=future_x0_true.permute(0, 2, 1, 3).shape, sampling_steps=cfg.SAMPLING_STEPS
+                    shape=future_x0_true.permute(0, 2, 1, 3).shape, sampling_steps=cfg.SAMPLING_STEPS,
+                    eta=cfg.SAMPLING_ETA
                 )
                 generated_samples.append(sample)
             
@@ -808,43 +814,86 @@ def evaluate_model(train_cfg, model_path, scaler_path, device):
             median_prediction = torch.median(stacked_samples, dim=0).values
 
             denorm_pred, denorm_samples = median_prediction.cpu().numpy(), stacked_samples.cpu().numpy()
-            if scaler:
-                denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
-                denorm_samples = scaler.inverse_transform(denorm_samples.reshape(-1, 1)).reshape(denorm_samples.shape)
+            # if scaler:
+            #     denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
+            #     denorm_samples = scaler.inverse_transform(denorm_samples.reshape(-1, 1)).reshape(denorm_samples.shape)
             
-            all_predictions_list.append(denorm_pred)
-            all_samples_list.append(denorm_samples)
+            # all_predictions_list.append(denorm_pred)
+            # all_samples_list.append(denorm_samples)
+            all_predictions_list.append(median_prediction.cpu().numpy())
+            all_samples_list.append(stacked_samples.cpu().numpy())
 
-    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)[:y_true_original.shape[0]]
-    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)[:y_true_original.shape[0]]
+    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
+    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
 
-    np.save(f'./results/pred_{cfg.RUN_ID}.npy', all_predictions)
-    np.save(f'./results/samples_{cfg.RUN_ID}.npy', all_samples)
+    if not all_predictions_list:
+        # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除且 drop_last=False)
+        # 我们创建一个空的数组以避免 gather 失败
+        local_predictions = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
+        local_samples = np.empty((cfg.NUM_SAMPLES, 0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
+        local_true = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
+    else:
+        local_predictions = np.concatenate(all_predictions_list, axis=0)
+        local_samples = np.concatenate(all_samples_list, axis=1)
+        local_true = np.concatenate(all_true_list, axis=0)
 
-    try:
-        all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
-        all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
-        all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
-        print("\nBaseline predictions loaded for comparison.")
-        perform_significance = True
-    except FileNotFoundError:
-        print("\nBaseline predictions file not found. Skipping significance test.")
-        perform_significance = False
+    gathered_preds = [None] * world_size
+    gathered_samples = [None] * world_size
+    gathered_true = [None] * world_size
 
-    print(f"y_true shape:{y_true_original.shape}")
-    print(f"all_predictions shape:{all_predictions.shape}")
-    print(f"all_samples shape:{all_samples.shape}")
-    print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
+    dist.gather_object(local_predictions, gathered_preds if rank == 0 else None, dst=0)
+    dist.gather_object(local_samples, gathered_samples if rank == 0 else None, dst=0)
+    dist.gather_object(local_true, gathered_true if rank == 0 else None, dst=0)
 
-    final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
-    if perform_significance:
-        errors_model = np.abs(y_true_original.flatten() - all_predictions.flatten())
-        errors_baseline = np.abs(y_true_original.flatten() - all_baseline_preds.flatten())
-        dm_statistic, p_value = dm_test(errors_baseline, errors_model)
-        final_metrics['dm_stat'] = dm_statistic
-        final_metrics['p_value'] = p_value
-        
-    return final_metrics
+    if rank == 0:
+        # 拼接所有 GPU 的结果
+        all_predictions_norm = np.concatenate(gathered_preds, axis=0)
+        all_samples_norm = np.concatenate(gathered_samples, axis=1)
+        all_true_norm = np.concatenate(gathered_true, axis=0)
+
+        # 1. 在 rank 0 上进行反归一化
+        if scaler:
+            # (B, N, L, 1) -> (B*N*L, 1) -> (B*N*L, 1) -> (B, N, L, 1)
+            all_predictions = scaler.inverse_transform(all_predictions_norm.reshape(-1, 1)).reshape(all_predictions_norm.shape)
+            y_true_original = scaler.inverse_transform(all_true_norm.reshape(-1, 1)).reshape(all_true_norm.shape)
+            # (S, B, N, L, 1) -> (S*B*N*L, 1) -> (S*B*N*L, 1) -> (S, B, N, L, 1)
+            all_samples = scaler.inverse_transform(all_samples_norm.reshape(-1, 1)).reshape(all_samples_norm.shape)
+        else:
+            all_predictions = all_predictions_norm
+            y_true_original = all_true_norm
+            all_samples = all_samples_norm
+
+        # 2. 调整维度以匹配 calculate_metrics 函数的期望
+        # (B, N, L, 1) -> (B, N, L) -> (B, L, N)
+        all_predictions = all_predictions.squeeze(-1).transpose(0, 2, 1)
+        y_true_original = y_true_original.squeeze(-1).transpose(0, 2, 1)
+        # (S, B, N, L, 1) -> (S, B, N, L) -> (B, S, L, N)
+        all_samples = all_samples.squeeze(-1).transpose(1, 0, 3, 2)
+
+        np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
+        np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
+
+        try:
+            all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
+            all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
+            all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
+            print("\nBaseline predictions loaded for comparison.")
+            perform_significance = True
+        except FileNotFoundError:
+            print("\nBaseline predictions file not found. Skipping significance test.")
+            perform_significance = False
+
+        final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
+        if perform_significance:
+            errors_model = np.abs(y_true_original.flatten() - all_predictions.flatten())
+            errors_baseline = np.abs(y_true_original.flatten() - all_baseline_preds.flatten())
+            dm_statistic, p_value = dm_test(errors_baseline, errors_model)
+            final_metrics['dm_stat'] = dm_statistic
+            final_metrics['p_value'] = p_value
+            
+        return final_metrics
+    else:
+        return None
 
 if __name__ == "__main__":
     train()
