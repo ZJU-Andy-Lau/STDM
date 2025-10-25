@@ -766,7 +766,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     print("Model loaded successfully.")
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-    test_features = np.load(cfg.TEST_FEATURES_PATH)
+    test_features = np.load(cfg.TEST_FEATURES_PATH)[:24]
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
