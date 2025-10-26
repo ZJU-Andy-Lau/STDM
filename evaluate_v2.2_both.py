@@ -428,6 +428,9 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             # 基线模型 shape 适配
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
             all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
+            y_true_original = y_true_original[:all_baseline_preds.shape[0]]
+            all_predictions = all_predictions[:all_baseline_preds.shape[0]]
+            all_samples = all_samples[:all_baseline_preds.shape[0]]
             print("\n已加载基线模型 (TimeXer) 预测，用于 DM 显著性检验。")
             print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
             perform_significance = True
