@@ -870,6 +870,10 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         # (S, B, N, L, 1) -> (S, B, N, L) -> (B, S, L, N)
         all_samples = all_samples.squeeze(-1).transpose(1, 0, 3, 2)
 
+        print(f"y_true shape:{y_true_original.shape}")
+        print(f"all_predictions shape:{all_predictions.shape}")
+        print(f"all_samples shape:{all_samples.shape}")
+
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
@@ -878,6 +882,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
             all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
             print("\nBaseline predictions loaded for comparison.")
+            print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
             perform_significance = True
         except FileNotFoundError:
             print("\nBaseline predictions file not found. Skipping significance test.")
