@@ -878,14 +878,20 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
         try:
+            # 注意：这个基线文件路径是硬编码的
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
+            # 基线模型 shape 适配
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
             all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
-            print("\nBaseline predictions loaded for comparison.")
+            y_true_original = y_true_original[:all_baseline_preds.shape[0]]
+            all_predictions = all_predictions[:all_baseline_preds.shape[0]]
+            all_samples = all_samples[:all_baseline_preds.shape[0]]
+            print("\n已加载基线模型 (TimeXer) 预测，用于 DM 显著性检验。")
             print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
             perform_significance = True
         except FileNotFoundError:
-            print("\nBaseline predictions file not found. Skipping significance test.")
+            print("\n警告：基线预测文件 ./urbanev/TimeXer_predictions.npy 未找到。")
+            print("跳过 DM 显著性检验。")
             perform_significance = False
 
         final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
