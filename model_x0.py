@@ -88,7 +88,7 @@ class FiLMLayer(nn.Module):
 
 class SpatioTemporalTransformerBlock(nn.Module):
     """时空Transformer块 (空间注意力已优化, 并使用Pre-LN)。"""
-    def __init__(self, channels, context_dim, num_heads):
+    def __init__(self, channels, context_dim, num_heads, dropout_rate=0.1):
         super().__init__()
         assert channels % num_heads == 0, f"Channels ({channels}) must be divisible by num_heads ({num_heads})"
         self.channels = channels
@@ -96,13 +96,15 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.head_dim = channels // num_heads
 
         # --- 空间注意力 (融合 GCN + GAT) ---
-        self.spatial_layer = GCN_GAT_Layer(channels, channels, heads=num_heads, dropout=0.1)
+        self.spatial_layer = GCN_GAT_Layer(channels, channels, heads=num_heads, dropout=dropout_rate)
         self.spatial_norm = nn.LayerNorm(channels)  # Pre-LN
+        self.spatial_dropout = nn.Dropout(dropout_rate)
 
         
         # 时间注意力组件
         self.temporal_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
         self.temporal_norm = nn.LayerNorm(channels)
+        self.temporal_dropout = nn.Dropout(dropout_rate)
 
         # 条件注入
         self.use_film = context_dim > 0
@@ -115,6 +117,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(channels, channels * 4),
             nn.GELU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(channels * 4, channels)
         )
         self.ffn_norm = nn.LayerNorm(channels)
@@ -163,14 +166,14 @@ class SpatioTemporalTransformerBlock(nn.Module):
         x_spatial_permuted = x_spatial_reshaped.permute(0, 2, 1, 3)
         x_spatial = x_spatial_permuted.reshape(BN, L, C)
 
-        x = x_spatial_res + x_spatial  # 残差连接
+        x = x_spatial_res + self.spatial_dropout(x_spatial)  # 残差连接
 
         
         # --- 时间注意力 (Pre-LN) ---
         x_temporal_res = x
         x_norm = self.temporal_norm(x)
         x_attn, _ = self.temporal_attn(x_norm, x_norm, x_norm)
-        x = x_temporal_res + x_attn
+        x = x_temporal_res + self.temporal_dropout(x_attn)
 
         # --- 前馈网络 (Pre-LN) ---
         x_ffn_res = x
@@ -182,7 +185,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
 
 class ContextEncoder(nn.Module):
     """统一的上下文编码器 (已增加未来已知特征编码)。"""
-    def __init__(self, time_dim, history_dim, static_dim, future_known_dim, model_dim, context_dim, num_heads):
+    def __init__(self, time_dim, history_dim, static_dim, future_known_dim, model_dim, context_dim, num_heads, dropout_rate=0.1):
         super().__init__()
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_dim),
@@ -191,7 +194,7 @@ class ContextEncoder(nn.Module):
         )
         
         self.history_projection = nn.Linear(history_dim, model_dim)
-        self.history_encoder = SpatioTemporalTransformerBlock(model_dim, context_dim=0, num_heads=num_heads)
+        self.history_encoder = SpatioTemporalTransformerBlock(model_dim, context_dim=0, num_heads=num_heads, dropout_rate=dropout_rate)
         
         self.static_encoder = nn.Linear(static_dim, model_dim)
         
@@ -246,7 +249,7 @@ class ContextEncoder(nn.Module):
 
 class UGnetV2(nn.Module):
     """V2版本的时空U-Net去噪网络。"""
-    def __init__(self, in_features, out_features, context_dim, model_dim, num_heads, depth=2):
+    def __init__(self, in_features, out_features, context_dim, model_dim, num_heads, depth=2, dropout_rate=0.1):
         super().__init__()
         self.init_conv = nn.Conv1d(in_features, model_dim, kernel_size=1)
         
@@ -257,22 +260,22 @@ class UGnetV2(nn.Module):
         dims = [model_dim]
         current_dim = model_dim
         for _ in range(depth):
-            self.down_blocks.append(SpatioTemporalTransformerBlock(current_dim, context_dim, num_heads))
+            self.down_blocks.append(SpatioTemporalTransformerBlock(current_dim, context_dim, num_heads, dropout_rate))
             # --- 核心改动：Downsample现在负责增加通道数 ---
             self.downsamples.append(Downsample(current_dim, current_dim * 2))
             dims.append(current_dim * 2)
             current_dim *= 2
-        
-        self.bottleneck = SpatioTemporalTransformerBlock(dims[-1], context_dim, num_heads)
-        
+
+        self.bottleneck = SpatioTemporalTransformerBlock(dims[-1], context_dim, num_heads, dropout_rate)
+
         for i in range(depth):
             self.upsamples.append(Upsample(dims[-1]))
             
             in_ch = dims[-1] + dims[-2]
             out_ch = dims[-2]
             self.up_projections.append(nn.Conv1d(in_ch, out_ch, kernel_size=1))
-            self.up_blocks.append(SpatioTemporalTransformerBlock(out_ch, context_dim, num_heads))
-            
+            self.up_blocks.append(SpatioTemporalTransformerBlock(out_ch, context_dim, num_heads, dropout_rate))
+
             dims.pop()
             
         self.final_conv = nn.Conv1d(model_dim, out_features, kernel_size=1)
@@ -333,7 +336,7 @@ class UGnetV2(nn.Module):
 
 class SpatioTemporalDiffusionModelV2(nn.Module):
     """完整的V2.5版时空扩散模型。"""
-    def __init__(self, in_features, out_features, history_features, static_features, future_known_features, model_dim, num_heads, T=1000,depth=2):
+    def __init__(self, in_features, out_features, history_features, static_features, future_known_features, model_dim, num_heads, T=1000,depth=2, dropout_rate=0.1):
         super().__init__()
         self.T = T
         self.out_features = out_features
@@ -346,7 +349,8 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             future_known_dim=future_known_features,
             model_dim=model_dim,
             context_dim=context_dim,
-            num_heads=num_heads
+            num_heads=num_heads,
+            dropout_rate=dropout_rate
         )
         
         self.denoise_net = UGnetV2(
@@ -355,7 +359,8 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             context_dim=context_dim, 
             model_dim=model_dim,
             num_heads=num_heads,
-            depth=depth
+            depth=depth,
+            dropout_rate=dropout_rate
         )
         
         betas = torch.linspace(1e-4, 0.02, T)

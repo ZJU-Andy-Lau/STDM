@@ -77,11 +77,11 @@ class ConfigV2:
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
     EVAL_ON_VAL_STEPS = 20           # 评估时使用 20 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
-    EVAL_SEED = 42 
+    EVAL_SEED = 42    
 
     # 数据文件路径
     TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
-    VAL_FEATURES_PATH = './urbanev/features_test_v2.npy' # 暂时尝试将测试集作为验证集
+    VAL_FEATURES_PATH = './urbanev/features_valid_v2.npy' # 暂时尝试将测试集作为验证集
     TEST_FEATURES_PATH = './urbanev/features_test_v2.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
