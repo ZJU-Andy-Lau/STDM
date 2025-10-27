@@ -26,8 +26,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, CosineAnnealingWarmRestarts
 
-# 从您工作区中的 model_v2.py 导入 V2 模型
-from model_v2_gcngat import SpatioTemporalDiffusionModelV2
+# 从您工作区中的 model_x0.py 导入 V2 模型
+from model_x0 import SpatioTemporalDiffusionModelV2
 
 from scheduler import MultiStageOneCycleLR
 
