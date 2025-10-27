@@ -424,7 +424,10 @@ def train():
                 x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
                 predicted_noise = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
-                loss = criterion(predicted_noise, noise)
+                predicted_x0 = (x_k - sqrt_one_minus_alpha_bar_k * predicted_noise) / (sqrt_alpha_bar_k + 1e-9)
+                loss = criterion(predicted_x0, future_x0_p)
+
+                # loss = criterion(predicted_noise, noise)
                 loss = loss / cfg.ACCUMULATION_STEPS
 
             if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(train_dataloader):
