@@ -423,8 +423,8 @@ def train():
                 sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                 x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
-                predicted_noise = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
-                loss = criterion(predicted_noise, noise)
+                predicted_x0 = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
+                loss = criterion(predicted_x0, future_x0_p)
                 loss = loss / cfg.ACCUMULATION_STEPS
 
             if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(train_dataloader):
@@ -459,9 +459,9 @@ def train():
                     sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                     x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
-                    predicted_noise = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
-                    val_loss = criterion(predicted_noise, noise)
-                
+                    predicted_x0 = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
+                    val_loss = criterion(predicted_x0, future_x0_p)
+
                 total_val_loss += val_loss.item()
 
         avg_train_loss_local = total_train_loss / len(train_dataloader)
@@ -813,7 +813,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             stacked_samples = torch.stack(generated_samples, dim=0)
             median_prediction = torch.median(stacked_samples, dim=0).values
 
-            denorm_pred, denorm_samples = median_prediction.cpu().numpy(), stacked_samples.cpu().numpy()
+            
             # if scaler:
             #     denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
             #     denorm_samples = scaler.inverse_transform(denorm_samples.reshape(-1, 1)).reshape(denorm_samples.shape)
