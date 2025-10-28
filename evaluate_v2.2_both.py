@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 # --- 导入模型 ---
 # 确保 model_v2_gcngat.py 在同一个目录下
 try:
-    from model_v2_gcngat import SpatioTemporalDiffusionModelV2
+    from model_x0 import SpatioTemporalDiffusionModelV2
 except ImportError:
     print("错误：无法导入 'model_v2_gcngat.py'。")
     print("请确保 'model_v2_gcngat.py' 文件与此脚本在同一目录中。")
