@@ -572,7 +572,7 @@ def train():
     metrics_second_best_val = None
 
     # 1. --- 所有卡并行评估 BEST model ---
-    if best_model_path_synced:
+    if best_model_path_synced and os.path.exists(best_model_path_synced):
         if rank == 0:
             print(f"\n[ALL GPUS] Evaluating BEST model (in parallel): {os.path.basename(best_model_path_synced)}")
         # 所有进程都调用 evaluate_model，函数内部会处理 DDP
@@ -589,7 +589,7 @@ def train():
             print("No best model was saved. Skipping evaluation.")
             
     # 2. --- 所有卡并行评估 2ND BEST model ---
-    if second_best_model_path_synced:
+    if second_best_model_path_synced and os.path.exists(second_best_model_path_synced):
         if rank == 0:
              print(f"\n[ALL GPUS] Evaluating 2ND BEST model (in parallel): {os.path.basename(second_best_model_path_synced)}")
         # 所有进程再次调用 evaluate_model
@@ -606,7 +606,7 @@ def train():
             print(f"[ALL GPUS] No second best model was saved. Skipping evaluation.")
 
     # 3. --- 所有卡并行评估 BEST VAL model ---
-    if best_model_path_for_val_synced:
+    if best_model_path_for_val_synced and os.path.exists(best_model_path_for_val_synced):
         if rank == 0:
             print(f"\n[ALL GPUS] Evaluating BEST VAL model (in parallel): {os.path.basename(best_model_path_for_val_synced)}")
         # 所有进程都调用 evaluate_model，函数内部会处理 DDP
@@ -623,7 +623,7 @@ def train():
             print("No best val model was saved. Skipping evaluation.")
             
     # 4. --- 所有卡并行评估 2ND BEST VAL model ---
-    if second_best_model_path_for_val_synced:
+    if second_best_model_path_for_val_synced and os.path.exists(second_best_model_path_for_val_synced):
         if rank == 0:
              print(f"\n[ALL GPUS] Evaluating 2ND BEST VAL model (in parallel): {os.path.basename(second_best_model_path_for_val_synced)}")
         # 所有进程再次调用 evaluate_model
