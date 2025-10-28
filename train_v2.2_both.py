@@ -151,7 +151,7 @@ class ConfigV2:
 
     # 数据文件路径
     TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
-    VAL_FEATURES_PATH = './urbanev/features_test_v2.npy' # 暂时尝试将测试集作为验证集
+    VAL_FEATURES_PATH = './urbanev/features_valid_v2.npy' # 暂时尝试将测试集作为验证集
     TEST_FEATURES_PATH = './urbanev/features_test_v2.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
@@ -266,7 +266,7 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
     在验证集子集上运行 MAE 评估。
     此函数只应在 rank 0 上调用。
     """
-    set_seed(cfg.EVAL_SEED)
+    # set_seed(cfg.EVAL_SEED)
     model.eval() # 确保模型处于评估模式
     
     # --- 核心修改: 获取 rank 以便只在 rank 0 上显示 tqdm ---
@@ -850,7 +850,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
     cfg.DEVICE = device
 
-    set_seed(cfg.EVAL_SEED)
+    # set_seed(cfg.EVAL_SEED)
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
