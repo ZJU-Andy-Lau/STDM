@@ -124,7 +124,7 @@ class ConfigV2:
     MODEL_DIM = 64
     NUM_HEADS = 4
     DEPTH = 4
-    T = 200
+    T = 1000
     
     # 训练参数
     EPOCHS = 100
@@ -145,7 +145,7 @@ class ConfigV2:
     EVAL_ON_VAL_EPOCH = 5            # 每 5 个 epoch 运行一次
     EVAL_ON_VAL_BATCHES = 48         # 使用 50 个 batch 进行评估 (50 * BATCH_SIZE=200 个样本)
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
-    EVAL_ON_VAL_STEPS = 10           # 评估时使用 10 步采样 (为了速度)
+    EVAL_ON_VAL_STEPS = 20           # 评估时使用 10 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
     EVAL_SEED = 42 
 
@@ -771,8 +771,8 @@ def train():
 
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 20
-    SAMPLING_STEPS = 20
+    NUM_SAMPLES = 40
+    SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def calculate_metrics(y_true, y_pred_median, y_pred_samples, device):
