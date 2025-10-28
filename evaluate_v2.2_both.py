@@ -499,15 +499,16 @@ def main():
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_best.pth")
         },
         {
-            "name": "2nd Best (MAE)",
-            "key": "mae_second_best",
-            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_second_best.pth")
-        },
-        {
             "name": "Best (Loss)",
             "key": "best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
         },
+        {
+            "name": "2nd Best (MAE)",
+            "key": "mae_second_best",
+            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_second_best.pth")
+        },
+        
         {
             "name": "2nd Best (Loss)",
             "key": "second_best",
