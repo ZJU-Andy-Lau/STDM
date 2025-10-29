@@ -16,6 +16,7 @@ import properscoring as ps
 from contextlib import nullcontext
 import math
 import random
+import csv
 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
@@ -30,6 +31,74 @@ from torch.optim.lr_scheduler import LambdaLR, SequentialLR, CosineAnnealingWarm
 from model_x0 import SpatioTemporalDiffusionModelV2
 
 from scheduler import MultiStageOneCycleLR
+
+class CsvLogger:
+    """
+    一个用于 DDP 训练的模块化 CSV 日志记录器。
+    它只会在 rank 0 进程上创建和写入文件。
+    """
+    def __init__(self, log_dir, run_id, rank, headers):
+        """
+        初始化记录器。
+
+        参数:
+            log_dir (str): 日志文件存放的目录 (例如: './results')
+            run_id (str): 当前运行的 ID，用作文件名 (例如: '20251028_100000')
+            rank (int): 当前 DDP 进程的 rank。
+            headers (list[str]): CSV 文件的表头 (例如: ['epoch', 'train_loss', 'val_loss'])
+        """
+        self.log_dir = log_dir
+        self.run_id = run_id
+        self.rank = rank
+        self.headers = headers
+        self.log_file_path = None
+
+        # 只有 rank 0 进程执行文件操作
+        if self.rank == 0:
+            try:
+                # 确保日志目录存在
+                os.makedirs(self.log_dir, exist_ok=True)
+                
+                # 定义日志文件路径
+                self.log_file_path = os.path.join(self.log_dir, f"{self.run_id}.csv")
+                
+                # 创建文件并写入表头
+                with open(self.log_file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(self.headers)
+                print(f"[Rank 0] CsvLogger initialized. Logging to {self.log_file_path}")
+                    
+            except Exception as e:
+                print(f"[Rank 0 Logger Error] Failed to initialize logger: {e}")
+                self.log_file_path = None # 初始化失败，禁用日志
+
+    def log_epoch(self, epoch_data):
+        """
+        记录一个 epoch 的数据。
+
+        参数:
+            epoch_data (dict): 包含要记录数据的字典。
+                               键 (key) 必须与初始化时的 headers 对应。
+                               例如: {'epoch': 1, 'train_loss': 0.5, ...}
+        """
+        # 只有 rank 0 且日志文件已成功初始化时才写入
+        if self.rank != 0 or self.log_file_path is None:
+            return
+
+        try:
+            # 按表头顺序准备要写入的数据行
+            # 使用 .get(h, '') 来优雅地处理缺失值：
+            # 如果字典中没有某个键 (例如 'avg_val_mae')，
+            # 它会写入一个空字符串，而不是-
+            row = [epoch_data.get(h, '') for h in self.headers]
+            
+            # 以追加模式 ('a') 打开文件并写入数据
+            with open(self.log_file_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+                
+        except Exception as e:
+            print(f"[Rank 0 Logger Error] Failed to log epoch data: {e}")
 
 # --- V2 版本配置参数 (已修改以对齐V2.3) ---
 class ConfigV2:
@@ -293,6 +362,15 @@ def train():
         cfg.RUN_ID = run_id_list[0]
         scaler_save_path = cfg.SCALER_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
 
+    log_headers = ['epoch', 'avg_train_loss', 'avg_val_loss', 'lr', 'avg_val_mae']
+    csv_logger = CsvLogger(
+        log_dir='./results',  # 指定日志目录
+        run_id=cfg.RUN_ID,    # 使用全局唯一的 run_id
+        rank=rank,            # 传入当前进程的 rank
+        headers=log_headers
+    )
+
+
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
     distances = adj_matrix[adj_matrix > 0]
     sigma = np.std(distances)
@@ -475,6 +553,17 @@ def train():
         dist.all_reduce(avg_val_loss_tensor, op=dist.ReduceOp.SUM)
         avg_val_loss = avg_val_loss_tensor.item() / world_size
 
+        if rank == 0:
+            # 初始化本 epoch 的日志数据字典
+            epoch_log_data = {
+                'epoch': epoch + 1,
+                'avg_train_loss': avg_train_loss,
+                'avg_val_loss': avg_val_loss,
+                'lr': optimizer.param_groups[0]['lr'],
+                'avg_val_mae': ''  # 默认为空字符串，如果 MAE 不运行，则记录为空
+            }
+
+
         # --- 核心修改3: 更新保存最佳/次佳模型的逻辑 ---
         if rank == 0:
             print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
@@ -522,6 +611,8 @@ def train():
                 current_val_seq = current_val_seq[:len(y_true_original)]
                 current_val_mae = np.mean(np.abs(current_val_seq - y_true_original))
 
+                epoch_log_data['avg_val_mae'] = current_val_mae
+
                 # 打印日志
                 mae_log = f", Avg Val MAE: {current_val_mae:.4f}" if current_val_mae != float('inf') else ", Avg Val MAE: (skipped)"
                 print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}{mae_log}, LR: {optimizer.param_groups[0]['lr']:.2e}")            
@@ -552,7 +643,8 @@ def train():
                     torch.save(ddp_model.module.state_dict(), model_save_path_mae_second_best)
                     second_best_model_path_for_eval = model_save_path_mae_second_best
                     print(f"🥈 New 2nd best model saved to {model_save_path_mae_second_best} with validation MAE: {second_best_val_mae:.4f}")
-
+        if rank == 0:
+            csv_logger.log_epoch(epoch_log_data)
 
         dist.barrier()
         scheduler.step()
