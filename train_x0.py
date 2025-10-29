@@ -43,9 +43,9 @@ class ConfigV2:
     
     # 特征维度定义
     TARGET_FEAT_DIM = 1
-    DYNAMIC_FEAT_DIM = 7
+    DYNAMIC_FEAT_DIM = 10
     STATIC_FEAT_DIM = 4
-    FUTURE_KNOWN_FEAT_DIM = 5
+    FUTURE_KNOWN_FEAT_DIM = 8
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
@@ -59,7 +59,7 @@ class ConfigV2:
     # 训练参数
     EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 5e-5
     ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
@@ -73,7 +73,7 @@ class ConfigV2:
     # --- 周期性 MAE 评估的配置 ---
     EVAL_ON_VAL = True               # 是否开启周期性 MAE 评估
     EVAL_ON_VAL_EPOCH = 5            # 每 5 个 epoch 运行一次
-    EVAL_ON_VAL_BATCHES = 50         # 使用 50 个 batch 进行评估 (50 * BATCH_SIZE=200 个样本)
+    EVAL_ON_VAL_BATCHES = 48         # 使用 48 个 batch 进行评估 (48 * BATCH_SIZE=192 个样本)
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
     EVAL_ON_VAL_STEPS = 20           # 评估时使用 20 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
@@ -346,7 +346,8 @@ def train():
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=False)
 
     optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss()
+    criterion = nn.HuberLoss()
     scaler = amp.GradScaler()
 
     # warmup_scheduler = LambdaLR(
