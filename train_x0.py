@@ -347,7 +347,7 @@ def train():
 
     optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
     # criterion = nn.MSELoss()
-    criterion = nn.HuberLoss()
+    criterion = nn.HuberLoss(delta=0.17)
     scaler = amp.GradScaler()
 
     # warmup_scheduler = LambdaLR(
