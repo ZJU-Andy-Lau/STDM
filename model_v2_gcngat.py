@@ -6,7 +6,7 @@ from torch_geometric.utils import softmax
 from torch_geometric.nn import GCNConv, GATConv
 
 
-def get_cosine_alphas_cumprod(timesteps, s=0.008):
+def get_cosine_schedule_buffers(timesteps, s=0.008):
     """
     根据余弦调度计算 alphas_cumprod (alpha_bar_t)。
     f(t) = cos^2( ((t/T + s) / (1 + s)) * pi/2 )
@@ -15,8 +15,17 @@ def get_cosine_alphas_cumprod(timesteps, s=0.008):
     steps = timesteps + 1
     t = torch.linspace(0, timesteps, steps)
     f_t = torch.cos(((t / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = f_t / f_t[0]
-    return alphas_cumprod
+    alphas_cumprod_cos = f_t / f_t[0]
+    alphas_cumprod_prev = alphas_cumprod_cos[:-1]
+    alphas_cumprod = alphas_cumprod_cos[1:]
+
+    betas = 1. - (alphas_cumprod / alphas_cumprod_prev)
+    betas = torch.clamp(betas, 1e-8, 0.999)
+
+    alphas = 1. - betas
+    alphas_cumprod_final = torch.cumprod(alphas, axis=0)
+    
+    return betas, alphas, alphas_cumprod_final
 
 # --- 基础模块 (Foundation Modules) ---
 
@@ -373,24 +382,16 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
         # 线性调度
         # betas = torch.linspace(1e-4, 0.02, T)
 
-        # 二次方调度：在 beta 的平方根上进行线性插值，然后再平方
-        beta_start = 1e-4
-        beta_end = 0.5
-        betas = torch.linspace(beta_start**0.5, beta_end**0.5, T)**2
+        # # 二次方调度：在 beta 的平方根上进行线性插值，然后再平方
+        # beta_start = 1e-4
+        # beta_end = 0.5
+        # betas = torch.linspace(beta_start**0.5, beta_end**0.5, T)**2
 
-        alphas = 1. - betas
+        # alphas = 1. - betas
 
         # 余弦调度
-        alphas_cumprod_cos = get_cosine_alphas_cumprod(T)
-        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod_cos[:-1]])
-        alphas_cumprod = alphas_cumprod_cos[1:]
-        betas = 1. - (alphas_cumprod / alphas_cumprod_prev)
-        betas = torch.clamp(betas, min=1e-8, max=0.999)
-        alphas = 1. - betas
+        betas, alphas,  alphas_cumprod = get_cosine_schedule_buffers(T)
 
-
-        
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
