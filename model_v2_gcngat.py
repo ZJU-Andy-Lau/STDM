@@ -358,7 +358,12 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             depth=depth
         )
         
-        betas = torch.linspace(1e-4, 0.02, T)
+        # betas = torch.linspace(1e-4, 0.02, T)
+        # 二次方调度：在 beta 的平方根上进行线性插值，然后再平方
+        beta_start = 1e-4
+        beta_end = 0.5
+        betas = torch.linspace(beta_start**0.5, beta_end**0.5, T)**2
+
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
         self.register_buffer('betas', betas)
