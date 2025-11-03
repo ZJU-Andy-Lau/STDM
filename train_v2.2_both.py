@@ -669,40 +669,6 @@ def train():
     metrics_best_val = None
     metrics_second_best_val = None
 
-    # 1. --- 所有卡并行评估 BEST model ---
-    if best_model_path_synced and os.path.exists(best_model_path_synced):
-        if rank == 0:
-            print(f"\n[ALL GPUS] Evaluating BEST model (in parallel): {os.path.basename(best_model_path_synced)}")
-        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
-        metrics_best = evaluate_model(
-            cfg, best_model_path_synced, scaler_save_path, 
-            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best'
-        )
-        if rank == 0:
-            print(f"[ALL GPUS] Finished evaluating BEST model.")
-            print(f"===== [FINAL RESULT 1/4] BEST Model ({os.path.basename(best_model_path_synced)}) =====")
-            print_metrics(metrics_best)
-    else:
-        if rank == 0:
-            print("No best model was saved. Skipping evaluation.")
-            
-    # 2. --- 所有卡并行评估 2ND BEST model ---
-    if second_best_model_path_synced and os.path.exists(second_best_model_path_synced):
-        if rank == 0:
-             print(f"\n[ALL GPUS] Evaluating 2ND BEST model (in parallel): {os.path.basename(second_best_model_path_synced)}")
-        # 所有进程再次调用 evaluate_model
-        metrics_second_best = evaluate_model(
-            cfg, second_best_model_path_synced, scaler_save_path, 
-            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best'
-        )
-        if rank == 0:
-            print(f"[ALL GPUS] Finished evaluating 2ND BEST model.")
-            print(f"\n===== [FINAL RESULT 2/4] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
-            print_metrics(metrics_second_best)
-    else:
-        if rank == 0:
-            print(f"[ALL GPUS] No second best model was saved. Skipping evaluation.")
-
     # 3. --- 所有卡并行评估 BEST VAL model ---
     if best_model_path_for_val_synced and os.path.exists(best_model_path_for_val_synced):
         if rank == 0:
@@ -714,7 +680,7 @@ def train():
         )
         if rank == 0:
             print(f"[ALL GPUS] Finished evaluating BEST VAL model.")
-            print(f"===== [FINAL RESULT 3/4] BEST VAL Model ({os.path.basename(best_model_path_for_val_synced)}) =====")
+            print(f"===== [FINAL RESULT 1/4] BEST VAL Model ({os.path.basename(best_model_path_for_val_synced)}) =====")
             print_metrics(metrics_best_val)
     else:
         if rank == 0:
@@ -731,11 +697,46 @@ def train():
         )
         if rank == 0:
             print(f"[ALL GPUS] Finished evaluating 2ND BEST VAL model.")
-            print(f"\n===== [FINAL RESULT 4/4] 2ND BEST VAL Model ({os.path.basename(second_best_model_path_for_val_synced)}) =====")
+            print(f"\n===== [FINAL RESULT 2/4] 2ND BEST VAL Model ({os.path.basename(second_best_model_path_for_val_synced)}) =====")
             print_metrics(metrics_second_best_val)
     else:
         if rank == 0:
             print(f"[ALL GPUS] No second best val model was saved. Skipping evaluation.")
+
+    # 1. --- 所有卡并行评估 BEST model ---
+    if best_model_path_synced and os.path.exists(best_model_path_synced):
+        if rank == 0:
+            print(f"\n[ALL GPUS] Evaluating BEST model (in parallel): {os.path.basename(best_model_path_synced)}")
+        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
+        metrics_best = evaluate_model(
+            cfg, best_model_path_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating BEST model.")
+            print(f"===== [FINAL RESULT 3/4] BEST Model ({os.path.basename(best_model_path_synced)}) =====")
+            print_metrics(metrics_best)
+    else:
+        if rank == 0:
+            print("No best model was saved. Skipping evaluation.")
+            
+    # 2. --- 所有卡并行评估 2ND BEST model ---
+    if second_best_model_path_synced and os.path.exists(second_best_model_path_synced):
+        if rank == 0:
+             print(f"\n[ALL GPUS] Evaluating 2ND BEST model (in parallel): {os.path.basename(second_best_model_path_synced)}")
+        # 所有进程再次调用 evaluate_model
+        metrics_second_best = evaluate_model(
+            cfg, second_best_model_path_synced, scaler_save_path, 
+            device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best'
+        )
+        if rank == 0:
+            print(f"[ALL GPUS] Finished evaluating 2ND BEST model.")
+            print(f"\n===== [FINAL RESULT 4/4] 2ND BEST Model ({os.path.basename(second_best_model_path_synced)}) =====")
+            print_metrics(metrics_second_best)
+    else:
+        if rank == 0:
+            print(f"[ALL GPUS] No second best model was saved. Skipping evaluation.")
+
 
     if rank == 0:
         print("\n" + "="*50 + "\nSequential Evaluation Results\n" + "="*50 + "\n")
