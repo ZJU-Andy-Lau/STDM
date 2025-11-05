@@ -143,9 +143,9 @@ class ConfigV2:
     # --- 周期性 MAE 评估的配置 ---
     EVAL_ON_VAL = True               # 是否开启周期性 MAE 评估
     EVAL_ON_VAL_EPOCH = 5            # 每 5 个 epoch 运行一次
-    EVAL_ON_VAL_BATCHES = 48         # 使用 50 个 batch 进行评估 (50 * BATCH_SIZE=200 个样本)
+    EVAL_ON_VAL_BATCHES = 48         # 使用 48 个 batch 进行评估 (48 * BATCH_SIZE=192 个样本)
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
-    EVAL_ON_VAL_STEPS = 20           # 评估时使用 10 步采样 (为了速度)
+    EVAL_ON_VAL_STEPS = 20           # 评估时使用 20 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
     EVAL_SEED = 42 
 
@@ -217,7 +217,8 @@ class EVChargerDatasetV2(Dataset):
         future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
-        return history_c, self.static_features, future_x0, future_known_c
+        return history_c, self.static_features, future_x0, future_known_c, idx
+
 
     def get_scaler(self):
         return self.scaler
@@ -280,7 +281,7 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
     )
 
     all_predictions_list = []
-    for (history_c, static_c, future_x0_true, future_known_c) in progress_bar:
+    for (history_c, static_c, future_x0_true, future_known_c, idx) in progress_bar:
         # --- 核心修改: 所有 rank 并行执行 ---
         tensors = [d.to(device) for d in (history_c, static_c, future_x0_true, future_known_c)]
         history_c, static_c, future_x0_true, future_known_c = tensors
@@ -487,7 +488,7 @@ def train():
         total_train_loss = 0.0
         optimizer.zero_grad()
 
-        for i, (history_c, static_c, future_x0, future_known_c) in enumerate(progress_bar):
+        for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
             tensors = [d.to(device_id) for d in (history_c, static_c, future_x0, future_known_c)]
             history_c, static_c, future_x0, future_known_c = tensors
             
@@ -525,7 +526,7 @@ def train():
         
         with torch.no_grad():
             for tensors in val_dataloader:
-                history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors]
+                history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
                 
                 with amp.autocast():
                     b = future_x0.shape[0]
@@ -878,6 +879,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
     test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler=scaler)
+    print(f"Test dataset size: {len(test_dataset)} samples.")
     # --- 使用 DistributedSampler 切分测试集 ---
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
@@ -885,13 +887,19 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     # original_test_samples = create_sliding_windows(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     # y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_test_samples]).squeeze(-1)
 
-    all_predictions_list, all_samples_list, all_true_list = [], [], []
+    all_predictions_list, all_samples_list, all_true_list, all_idx_list = [], [], [], []
 
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
-            history_c, static_c, future_x0_true, future_known_c = [d.to(cfg.DEVICE) for d in tensors]
+            history_c, static_c, future_x0_true, future_known_c, idx = tensors
+            history_c = history_c.to(cfg.DEVICE)
+            static_c = static_c.to(cfg.DEVICE)
+            future_x0_true = future_x0_true.to(cfg.DEVICE)
+            future_known_c = future_known_c.to(cfg.DEVICE)
+
             all_true_list.append(future_x0_true.permute(0, 2, 1, 3).cpu().numpy())
+            all_idx_list.append(idx.cpu().numpy()) 
 
             b = history_c.shape[0]
             len_list = calc_layer_lengths(cfg.PRED_LEN, cfg.DEPTH)
@@ -925,30 +933,44 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
     all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
 
+    print(f"Rank {rank} :idx list:{all_idx_list}")
+
     if not all_predictions_list:
         # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除且 drop_last=False)
         # 我们创建一个空的数组以避免 gather 失败
         local_predictions = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_samples = np.empty((cfg.NUM_SAMPLES, 0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_true = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
+        local_idx = np.empty((0,), dtype=np.int64)
     else:
         local_predictions = np.concatenate(all_predictions_list, axis=0)
         local_samples = np.concatenate(all_samples_list, axis=1)
         local_true = np.concatenate(all_true_list, axis=0)
+        local_idx = np.concatenate(all_idx_list, axis=0) 
 
     gathered_preds = [None] * world_size
     gathered_samples = [None] * world_size
     gathered_true = [None] * world_size
+    gathered_idx = [None] * world_size
 
     dist.gather_object(local_predictions, gathered_preds if rank == 0 else None, dst=0)
     dist.gather_object(local_samples, gathered_samples if rank == 0 else None, dst=0)
     dist.gather_object(local_true, gathered_true if rank == 0 else None, dst=0)
-
+    dist.gather_object(local_idx, gathered_idx if rank == 0 else None, dst=0)
+    
     if rank == 0:
         # 拼接所有 GPU 的结果
         all_predictions_norm = np.concatenate(gathered_preds, axis=0)
         all_samples_norm = np.concatenate(gathered_samples, axis=1)
         all_true_norm = np.concatenate(gathered_true, axis=0)
+        all_idx = np.concatenate(gathered_idx, axis=0)
+        print(f"gather index:{all_idx}")
+
+        order = np.argsort(all_idx)
+        print(f"order:{order}")
+        all_predictions_norm = all_predictions_norm[order]
+        all_true_norm = all_true_norm[order]
+        all_samples_norm = all_samples_norm[:, order]
 
         # 1. 在 rank 0 上进行反归一化
         if scaler:
@@ -973,6 +995,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         print(f"all_predictions shape:{all_predictions.shape}")
         print(f"all_samples shape:{all_samples.shape}")
 
+        np.save(f'./results/truths.npy', y_true_original)
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
