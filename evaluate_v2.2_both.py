@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 # --- 导入模型 ---
 # 确保 model_v2_gcngat.py 在同一个目录下
 try:
-    from model_x0 import SpatioTemporalDiffusionModelV2
+    from model_v2_gcngat import SpatioTemporalDiffusionModelV2
 except ImportError:
     print("错误：无法导入 'model_v2_gcngat.py'。")
     print("请确保 'model_v2_gcngat.py' 文件与此脚本在同一目录中。")
@@ -50,9 +50,9 @@ class ConfigV2:
     
     # 特征维度定义
     TARGET_FEAT_DIM = 1
-    DYNAMIC_FEAT_DIM = 7
+    DYNAMIC_FEAT_DIM = 9
     STATIC_FEAT_DIM = 4
-    FUTURE_KNOWN_FEAT_DIM = 5
+    FUTURE_KNOWN_FEAT_DIM = 7
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
@@ -494,26 +494,27 @@ def main():
     
     models_to_evaluate = [
         {
+            "name": "2nd Best (Loss)",
+            "key": "second_best",
+            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_second_best.pth")
+        },
+        {
             "name": "Best (MAE)",
             "key": "mae_best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_best.pth")
         },
-        {
-            "name": "Best (Loss)",
-            "key": "best",
-            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
-        },
+        # {
+        #     "name": "Best (Loss)",
+        #     "key": "best",
+        #     "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
+        # },
         {
             "name": "2nd Best (MAE)",
             "key": "mae_second_best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_second_best.pth")
         },
         
-        {
-            "name": "2nd Best (Loss)",
-            "key": "second_best",
-            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_second_best.pth")
-        }
+
     ]
 
     # 只有 Rank 0 检查 Scaler

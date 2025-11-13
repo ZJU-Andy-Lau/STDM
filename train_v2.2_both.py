@@ -113,9 +113,9 @@ class ConfigV2:
     
     # 特征维度定义
     TARGET_FEAT_DIM = 1
-    DYNAMIC_FEAT_DIM = 10
+    DYNAMIC_FEAT_DIM = 12
     STATIC_FEAT_DIM = 4
-    FUTURE_KNOWN_FEAT_DIM = 8
+    FUTURE_KNOWN_FEAT_DIM = 10
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
@@ -130,7 +130,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 1
+    ACCUMULATION_STEPS = 4
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
@@ -150,9 +150,9 @@ class ConfigV2:
     EVAL_SEED = 42 
 
     # 数据文件路径
-    TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
-    VAL_FEATURES_PATH = './urbanev/features_valid_v2.npy' # 暂时尝试将测试集作为验证集
-    TEST_FEATURES_PATH = './urbanev/features_test_v2.npy'
+    TRAIN_FEATURES_PATH = './urbanev/features_train_wea.npy'
+    VAL_FEATURES_PATH = './urbanev/features_valid_wea.npy' # 暂时尝试将测试集作为验证集
+    TEST_FEATURES_PATH = './urbanev/features_test_wea.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
 # --- 辅助函数 ---
