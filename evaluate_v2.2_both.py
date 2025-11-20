@@ -50,9 +50,9 @@ class ConfigV2:
     
     # 特征维度定义
     TARGET_FEAT_DIM = 1
-    DYNAMIC_FEAT_DIM = 9
-    STATIC_FEAT_DIM = 4
-    FUTURE_KNOWN_FEAT_DIM = 7
+    DYNAMIC_FEAT_DIM = 12
+    STATIC_FEAT_DIM = 7
+    FUTURE_KNOWN_FEAT_DIM = 13
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
@@ -67,7 +67,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 1
+    ACCUMULATION_STEPS = 4
 
     WARMUP_EPOCHS = 5
     COOLDOWN_EPOCHS = 50
@@ -81,19 +81,19 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 50
     EVAL_ON_VAL_SAMPLES = 5
     EVAL_ON_VAL_STEPS = 20
-    SAMPLING_ETA = 0.0
+    SAMPLING_ETA = 0.3
     EVAL_SEED = 42 
 
     # 数据文件路径
-    TRAIN_FEATURES_PATH = './urbanev/features_train_v2.npy'
-    VAL_FEATURES_PATH = './urbanev/features_test_v2.npy'
-    TEST_FEATURES_PATH = './urbanev/features_test_v2.npy'
+    TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi.npy'
+    VAL_FEATURES_PATH = './urbanev/features_test_wea_poi.npy'
+    TEST_FEATURES_PATH = './urbanev/features_test_wea_poi.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 20
+    NUM_SAMPLES = 40
     SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -494,27 +494,26 @@ def main():
     
     models_to_evaluate = [
         {
-            "name": "2nd Best (Loss)",
-            "key": "second_best",
-            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_second_best.pth")
+            "name": "Best (Loss)",
+            "key": "best",
+            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
         },
         {
             "name": "Best (MAE)",
             "key": "mae_best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_best.pth")
         },
-        # {
-        #     "name": "Best (Loss)",
-        #     "key": "best",
-        #     "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
-        # },
+        {
+            "name": "2nd Best (Loss)",
+            "key": "second_best",
+            "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_second_best.pth")
+        },
         {
             "name": "2nd Best (MAE)",
             "key": "mae_second_best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_second_best.pth")
         },
         
-
     ]
 
     # 只有 Rank 0 检查 Scaler

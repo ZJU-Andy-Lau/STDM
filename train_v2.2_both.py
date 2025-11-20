@@ -130,7 +130,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 1
+    ACCUMULATION_STEPS = 4
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
@@ -633,7 +633,7 @@ def train():
                             except OSError as e:
                                 print(f"Warning: Could not remove old second_best model: {e}")
                         # 将旧的 "best" 重命名为 "second_best"
-                        os.rename(best_model_path_for_eval, model_save_path_second_best)
+                        os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
                         print(f"Model {os.path.basename(best_model_path_for_eval)} promoted to 2nd best (MAE).")
                         second_best_model_path_for_eval = model_save_path_mae_second_best
 
