@@ -93,7 +93,7 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 40
+    NUM_SAMPLES = 20
     SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -131,13 +131,11 @@ class EVChargerDatasetV2(Dataset):
         target_col_original = dynamic_features[:, :, 0]
 
         if scaler is None:
-            # 在评估模式下，我们不应该初始化scaler，只应该加载
-            print("警告：评估时未提供Scaler。如果模型已归一化，结果将不准确。")
-            self.scaler = None
+            self.scaler = self._initialize_scaler(target_col_original)
         else:
             self.scaler = scaler
 
-        if self.scaler and self.cfg.NORMALIZATION_TYPE != "none":
+        if self.cfg.NORMALIZATION_TYPE != "none":
             target_col_reshaped = target_col_original.reshape(-1, 1)
             normalized_target = self.scaler.transform(target_col_reshaped)
             dynamic_features[:, :, 0] = normalized_target.reshape(target_col_original.shape)
@@ -145,8 +143,13 @@ class EVChargerDatasetV2(Dataset):
         self.samples = create_sliding_windows(dynamic_features, history_len, pred_len)
 
     def _initialize_scaler(self, data):
-        # 评估脚本不负责创建 scaler
-        raise RuntimeError("评估脚本不应初始化 Scaler。请提供已训练的 Scaler。")
+        if self.cfg.NORMALIZATION_TYPE == "minmax":
+            scaler = MinMaxScaler(feature_range=(-1, 1))
+        elif self.cfg.NORMALIZATION_TYPE == "zscore":
+            scaler = StandardScaler()
+        else: return None
+        scaler.fit(data.reshape(-1, 1))
+        return scaler
 
     def __len__(self):
         return len(self.samples)
@@ -157,7 +160,8 @@ class EVChargerDatasetV2(Dataset):
         future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
-        return history_c, self.static_features, future_x0, future_known_c
+        return history_c, self.static_features, future_x0, future_known_c, idx
+
 
     def get_scaler(self):
         return self.scaler
@@ -263,13 +267,13 @@ def dm_test(e1, e2, h=12, crit="MAD"):
 # 2. 从 train_v2.2_both.py 复制完整的 evaluate_model 函数
 # =============================================================================
 
-def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size, key):
+def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,key):
     cfg = EvalConfig()
     cfg.RUN_ID = train_cfg.RUN_ID
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
     cfg.DEVICE = device
 
-    set_seed(cfg.EVAL_SEED)
+    # set_seed(cfg.EVAL_SEED)
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
@@ -277,43 +281,15 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM, model_dim=cfg.MODEL_DIM,
         num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH
     ).to(cfg.DEVICE)
-    
-    # --- 核心：加载模型 ---
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=cfg.DEVICE))
-    except FileNotFoundError:
-        if rank == 0:
-            print(f"错误：模型文件未找到于: {model_path}")
-        return None # 评估失败
-    except Exception as e:
-        if rank == 0:
-            print(f"加载模型时出错: {e}")
-        return None
-        
+    model.load_state_dict(torch.load(model_path, map_location=cfg.DEVICE))
     model.eval()
-    if rank == 0:
-        print("模型加载成功。")
+    print("Model loaded successfully.")
 
-    # --- 核心：加载Scaler ---
-    if os.path.exists(scaler_path):
-        scaler = joblib.load(scaler_path)
-        if rank == 0:
-             print("Scaler 加载成功。")
-    else:
-        if rank == 0:
-            print(f"警告：Scaler 文件未找到于: {scaler_path}")
-            print("如果模型使用了归一化，评估结果将不准确。")
-        scaler = None
+    adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
+    test_features = np.load(cfg.TEST_FEATURES_PATH)
+    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
-    # --- 加载数据和图 ---
-    try:
-        adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
-        test_features = np.load(cfg.TEST_FEATURES_PATH)
-    except FileNotFoundError as e:
-        if rank == 0:
-            print(f"错误：数据文件未找到: {e.filename}。请检查 'urbanev' 文件夹。")
-        return None
-
+    adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
     distances = adj_matrix[adj_matrix > 0]
     sigma = np.std(distances)
 
@@ -323,19 +299,27 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
     test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler=scaler)
-    
+    print(f"Test dataset size: {len(test_dataset)} samples.")
     # --- 使用 DistributedSampler 切分测试集 ---
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler, num_workers=4, pin_memory=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
-    all_predictions_list, all_samples_list, all_true_list = [], [], []
+    # original_test_samples = create_sliding_windows(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
+    # y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_test_samples]).squeeze(-1)
 
-    # 只有 rank 0 显示 TQDM
-    disable_tqdm = (rank != 0)
+    all_predictions_list, all_samples_list, all_true_list, all_idx_list = [], [], [], []
+
+    disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
-        for tensors in tqdm(test_dataloader, desc=f"Evaluating (Rank {rank})", disable=disable_tqdm, ncols=100):
-            history_c, static_c, future_x0_true, future_known_c = [d.to(cfg.DEVICE) for d in tensors]
+        for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
+            history_c, static_c, future_x0_true, future_known_c, idx = tensors
+            history_c = history_c.to(cfg.DEVICE)
+            static_c = static_c.to(cfg.DEVICE)
+            future_x0_true = future_x0_true.to(cfg.DEVICE)
+            future_known_c = future_known_c.to(cfg.DEVICE)
+
             all_true_list.append(future_x0_true.permute(0, 2, 1, 3).cpu().numpy())
+            all_idx_list.append(idx.cpu().numpy()) 
 
             b = history_c.shape[0]
             len_list = calc_layer_lengths(cfg.PRED_LEN, cfg.DEPTH)
@@ -356,39 +340,57 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             stacked_samples = torch.stack(generated_samples, dim=0)
             median_prediction = torch.median(stacked_samples, dim=0).values
 
+            denorm_pred, denorm_samples = median_prediction.cpu().numpy(), stacked_samples.cpu().numpy()
+            # if scaler:
+            #     denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
+            #     denorm_samples = scaler.inverse_transform(denorm_samples.reshape(-1, 1)).reshape(denorm_samples.shape)
+            
+            # all_predictions_list.append(denorm_pred)
+            # all_samples_list.append(denorm_samples)
             all_predictions_list.append(median_prediction.cpu().numpy())
             all_samples_list.append(stacked_samples.cpu().numpy())
 
-    # --- 收集所有进程 (GPU) 的结果 ---
+    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
+    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
+
+    print(f"Rank {rank} :idx list:{all_idx_list}")
 
     if not all_predictions_list:
-        # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除)
+        # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除且 drop_last=False)
         # 我们创建一个空的数组以避免 gather 失败
         local_predictions = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_samples = np.empty((cfg.NUM_SAMPLES, 0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_true = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
+        local_idx = np.empty((0,), dtype=np.int64)
     else:
         local_predictions = np.concatenate(all_predictions_list, axis=0)
         local_samples = np.concatenate(all_samples_list, axis=1)
         local_true = np.concatenate(all_true_list, axis=0)
+        local_idx = np.concatenate(all_idx_list, axis=0) 
 
     gathered_preds = [None] * world_size
     gathered_samples = [None] * world_size
     gathered_true = [None] * world_size
+    gathered_idx = [None] * world_size
 
-    # --- 关键：DDP 收集操作 ---
     dist.gather_object(local_predictions, gathered_preds if rank == 0 else None, dst=0)
     dist.gather_object(local_samples, gathered_samples if rank == 0 else None, dst=0)
     dist.gather_object(local_true, gathered_true if rank == 0 else None, dst=0)
-
-    # --- 只在 Rank 0 上进行指标计算和打印 ---
+    dist.gather_object(local_idx, gathered_idx if rank == 0 else None, dst=0)
+    
     if rank == 0:
-        print("\n所有进程评估完成，正在 Rank 0 上汇总和计算指标...")
-        
         # 拼接所有 GPU 的结果
         all_predictions_norm = np.concatenate(gathered_preds, axis=0)
         all_samples_norm = np.concatenate(gathered_samples, axis=1)
         all_true_norm = np.concatenate(gathered_true, axis=0)
+        all_idx = np.concatenate(gathered_idx, axis=0)
+        print(f"gather index:{all_idx}")
+
+        order = np.argsort(all_idx)
+        print(f"order:{order}")
+        all_predictions_norm = all_predictions_norm[order]
+        all_true_norm = all_true_norm[order]
+        all_samples_norm = all_samples_norm[:, order]
 
         # 1. 在 rank 0 上进行反归一化
         if scaler:
@@ -398,7 +400,6 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             # (S, B, N, L, 1) -> (S*B*N*L, 1) -> (S*B*N*L, 1) -> (S, B, N, L, 1)
             all_samples = scaler.inverse_transform(all_samples_norm.reshape(-1, 1)).reshape(all_samples_norm.shape)
         else:
-            print("警告：未执行反归一化。")
             all_predictions = all_predictions_norm
             y_true_original = all_true_norm
             all_samples = all_samples_norm
@@ -414,14 +415,10 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         print(f"all_predictions shape:{all_predictions.shape}")
         print(f"all_samples shape:{all_samples.shape}")
 
-        # 确保结果目录存在
-        os.makedirs('./results', exist_ok=True)
+        np.save(f'./results/truths.npy', y_true_original)
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
-        np.save(f'./results/true_{cfg.RUN_ID}_{key}.npy', y_true_original) # 额外保存真实值
-        print(f"预测结果已保存到 ./results/pred_{cfg.RUN_ID}_{key}.npy")
 
-        # 3. 加载基线模型进行 DM 检验
         try:
             # 注意：这个基线文件路径是硬编码的
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
@@ -439,9 +436,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             print("跳过 DM 显著性检验。")
             perform_significance = False
 
-        # 4. 计算最终指标
         final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
-        
         if perform_significance:
             errors_model = np.abs(y_true_original.flatten() - all_predictions.flatten())
             errors_baseline = np.abs(y_true_original.flatten() - all_baseline_preds.flatten())
@@ -451,7 +446,6 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
             
         return final_metrics
     else:
-        # 其他进程 (rank != 0) 不返回任何东西
         return None
 
 # =============================================================================
@@ -495,22 +489,22 @@ def main():
     models_to_evaluate = [
         {
             "name": "Best (Loss)",
-            "key": "best",
+            "key": "best_val",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_best.pth")
         },
         {
             "name": "Best (MAE)",
-            "key": "mae_best",
+            "key": "best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_best.pth")
         },
         {
             "name": "2nd Best (Loss)",
-            "key": "second_best",
+            "key": "second_best_val",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_second_best.pth")
         },
         {
             "name": "2nd Best (MAE)",
-            "key": "mae_second_best",
+            "key": "second_best",
             "path": os.path.join(base_path, f"st_diffusion_model_v2_{run_id}_mae_second_best.pth")
         },
         
