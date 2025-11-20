@@ -353,7 +353,6 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
     all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
 
-    print(f"Rank {rank} :idx list:{all_idx_list}")
 
     if not all_predictions_list:
         # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除且 drop_last=False)
@@ -384,10 +383,9 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         all_samples_norm = np.concatenate(gathered_samples, axis=1)
         all_true_norm = np.concatenate(gathered_true, axis=0)
         all_idx = np.concatenate(gathered_idx, axis=0)
-        print(f"gather index:{all_idx}")
 
         order = np.argsort(all_idx)
-        print(f"order:{order}")
+
         all_predictions_norm = all_predictions_norm[order]
         all_true_norm = all_true_norm[order]
         all_samples_norm = all_samples_norm[:, order]
