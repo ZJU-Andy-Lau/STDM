@@ -788,8 +788,8 @@ def train():
 
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 10
-    SAMPLING_STEPS = 20
+    NUM_SAMPLES = 20
+    SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def calculate_metrics(y_true, y_pred_median, y_pred_samples, device):
