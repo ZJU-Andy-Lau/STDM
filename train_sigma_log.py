@@ -681,7 +681,7 @@ def train():
         scheduler.step()
 
     # --- 核心修改4: 采用V2.3的分布式评估流程 ---
-    dist.barrier()
+    dist.barrier() 
     if rank == 0:
         print("\n" + "="*50 + "\nTraining finished. Starting evaluation on the test set...\n" + "="*50 + "\n")
     
