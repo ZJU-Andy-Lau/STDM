@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 # --- 导入模型 ---
 # 确保 model_v2_gcngat.py 在同一个目录下
 try:
-    from model_v2_gcngat import SpatioTemporalDiffusionModelV2
+    from model_sigma import SpatioTemporalDiffusionModelV2
 except ImportError:
     print("错误：无法导入 'model_v2_gcngat.py'。")
     print("请确保 'model_v2_gcngat.py' 文件与此脚本在同一目录中。")
@@ -81,7 +81,7 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 50
     EVAL_ON_VAL_SAMPLES = 5
     EVAL_ON_VAL_STEPS = 20
-    SAMPLING_ETA = 0.3
+    SAMPLING_ETA = 0.5
     EVAL_SEED = 42 
 
     # 数据文件路径
@@ -93,8 +93,8 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 20
-    SAMPLING_STEPS = 50
+    NUM_SAMPLES = 10
+    SAMPLING_STEPS = 10
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 辅助函数：图处理 ---
