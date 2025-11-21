@@ -222,17 +222,17 @@ class ContextEncoder(nn.Module):
             hidden_size=model_dim,
             num_layers=2,
             batch_first=True,
-            dropout=0.2
+            dropout=0.05
         )
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(0.05)
         # <<< 修改：融合MLP的输入维度增加 >>>
         fusion_input_dim = time_dim + model_dim + model_dim + model_dim # t_emb, hist_emb, static_emb, future_emb
         self.fusion_mlp = nn.Sequential(
             nn.Linear(fusion_input_dim, context_dim),
             nn.Mish(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.05),
             nn.Linear(context_dim, context_dim),
-            nn.Dropout(0.2)
+            nn.Dropout(0.05)
         )
 
     def forward(self, k, history_c, static_c, future_known_c, edge_data):
