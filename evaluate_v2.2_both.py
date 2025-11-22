@@ -81,7 +81,7 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 50
     EVAL_ON_VAL_SAMPLES = 5
     EVAL_ON_VAL_STEPS = 20
-    SAMPLING_ETA = 0.5
+    SAMPLING_ETA = 0.0
     EVAL_SEED = 42 
 
     # 数据文件路径
@@ -93,8 +93,8 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 10
-    SAMPLING_STEPS = 10
+    NUM_SAMPLES = 20
+    SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 辅助函数：图处理 ---

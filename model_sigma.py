@@ -479,4 +479,4 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
                 
             x_k = x_prev
 
-        return x_k.clamp(-1.0, 1.0)
+        return x_k
