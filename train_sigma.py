@@ -225,8 +225,8 @@ class EVChargerDatasetV2(Dataset):
 
         dynamic_features[:, :, cfg.HISTORY_FEATURES-4:] = mm_norm[:, :, :4]
 
-        static_features[:, :, :5] = mm_norm[:, :, -5:]
-        static_features[:, :, 5:] = z_norm
+        static_features[:, :, :5] = mm_norm[0, :, -5:]
+        static_features[:, :, 5:] = z_norm[0, :, :]
         self.static_features = torch.tensor(static_features, dtype=torch.float)
         self.samples = create_sliding_windows(dynamic_features, history_len, pred_len)
 
