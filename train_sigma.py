@@ -190,7 +190,7 @@ class EVChargerDatasetV2(Dataset):
         
 
         dynamic_features = features[:, :, :cfg.HISTORY_FEATURES].copy()
-        static_features = features[:, :, cfg.HISTORY_FEATURES:].copy()
+        static_features = features[0:, :, cfg.HISTORY_FEATURES:].copy()
 
         target_col_original = dynamic_features[:, :, 0]
 
