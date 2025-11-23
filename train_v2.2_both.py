@@ -150,9 +150,9 @@ class ConfigV2:
     EVAL_SEED = 42 
 
     # 数据文件路径
-    TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi_norm.py'
-    VAL_FEATURES_PATH = './urbanev/features_valid_wea_poi_norm.py' # 暂时尝试将测试集作为验证集
-    TEST_FEATURES_PATH = './urbanev/features_test_wea_poi_norm.py'
+    TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi_norm.npy'
+    VAL_FEATURES_PATH = './urbanev/features_valid_wea_poi_norm.npy' # 暂时尝试将测试集作为验证集
+    TEST_FEATURES_PATH = './urbanev/features_test_wea_poi_norm.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
 # --- 辅助函数 ---
