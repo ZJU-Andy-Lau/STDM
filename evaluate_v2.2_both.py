@@ -81,7 +81,7 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 50
     EVAL_ON_VAL_SAMPLES = 5
     EVAL_ON_VAL_STEPS = 20
-    SAMPLING_ETA = 0.0
+    SAMPLING_ETA = 1.0
     EVAL_SEED = 42 
 
     # 数据文件路径
@@ -93,8 +93,8 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 20
-    SAMPLING_STEPS = 50
+    NUM_SAMPLES = 10
+    SAMPLING_STEPS = 10
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 辅助函数：图处理 ---
@@ -414,8 +414,8 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         print(f"all_samples shape:{all_samples.shape}")
 
         np.save(f'./results/truths.npy', y_true_original)
-        np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
-        np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
+        np.save(f'./results/pred_{cfg.RUN_ID}_{key}_1.0.npy', all_predictions)
+        np.save(f'./results/samples_{cfg.RUN_ID}_{key}_1.0.npy', all_samples)
 
         try:
             # 注意：这个基线文件路径是硬编码的

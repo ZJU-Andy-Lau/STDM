@@ -457,10 +457,10 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             pred_x0 = (x_k - torch.sqrt(1. - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
             # sigma_t = eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev))
             
-            min_logvar, max_logvar = -4.0, 0.5   # 可微调
+            min_logvar, max_logvar = -20.0, 2.0   # 可微调
             logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
     
-            var_scale = 2.0  
+            var_scale = 1.0  
             sigma_t = eta * torch.exp(0.5 * logvar) * var_scale
 
             # 4) 限制 sigma_t^2 不超过 (1 - alpha_cumprod_t_prev)
