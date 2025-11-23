@@ -302,6 +302,9 @@ class UGnetV2(nn.Module):
             dims.pop()
             
         self.final_conv = nn.Conv1d(model_dim, out_features*2, kernel_size=1)
+        # 初始化：让输出分布更温和一点
+        nn.init.zeros_(self.final_conv.bias)
+        nn.init.normal_(self.final_conv.weight, mean=0.0, std=0.02)
 
     def forward(self, x, context, edge_data_list):
         batch_size, num_nodes, seq_len, _ = x.shape
@@ -457,7 +460,7 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             pred_x0 = (x_k - torch.sqrt(1. - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
             # sigma_t = eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev))
             
-            min_logvar, max_logvar = -20.0, 2.0   # 可微调
+            min_logvar, max_logvar = -5.0, 3.0   # 可微调
             logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
     
             var_scale = 1.0  

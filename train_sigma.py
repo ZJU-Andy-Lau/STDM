@@ -559,14 +559,17 @@ def train():
 
                 predicted_noise, predicted_logvar = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
                 # 为数值稳定，限制 logvar 范围
-                min_logvar, max_logvar = -20.0, 2.0
+                min_logvar, max_logvar = -5.0, 3.0
                 pred_logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
 
                 # NLL: 0.5 * exp(-logσ²) * (ε - εθ)² + 0.5 * logσ²
                 nll = 0.5 * torch.exp(-pred_logvar) * (noise - predicted_noise) ** 2 + 0.5 * pred_logvar
 
+                # 额外正则：阻止 logvar 继续疯狂往负方向走（让它更偏向 0 一点）
+                logvar_reg = 1e-3 * (pred_logvar ** 2)
+
                 # 对所有维度取平均，再做梯度累积缩放
-                loss = nll.mean() / cfg.ACCUMULATION_STEPS
+                loss = (nll + logvar_reg).mean() / cfg.ACCUMULATION_STEPS
 
             if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(train_dataloader):
                 scaler.scale(loss).backward()
@@ -604,7 +607,7 @@ def train():
                         x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data
                     )
 
-                    min_logvar, max_logvar = -20.0, 2.0
+                    min_logvar, max_logvar = -5.0, 3.0
                     pred_logvar = torch.clamp(pred_logvar, min_logvar, max_logvar)
 
                     nll = 0.5 * torch.exp(-pred_logvar) * (noise - pred_noise) ** 2 + 0.5 * pred_logvar
