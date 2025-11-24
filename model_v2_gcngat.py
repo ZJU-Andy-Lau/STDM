@@ -215,7 +215,9 @@ class ContextEncoder(nn.Module):
         self.history_encoder = SpatioTemporalTransformerBlock(model_dim, context_dim=0, num_heads=num_heads)
         
         self.static_encoder = nn.Linear(static_dim, model_dim)
-        
+
+        self.dropout = nn.Dropout(0.05)
+
         # <<< 新增：使用GRU编码未来已知特征序列 >>>
         self.future_encoder = nn.GRU(
             input_size=future_known_dim,
@@ -258,6 +260,7 @@ class ContextEncoder(nn.Module):
         _, future_hidden_state = self.future_encoder(future_known_c)
         # 取最后一层的隐藏状态作为总结
         future_emb = future_hidden_state[-1]
+        future_emb = self.dropout(future_emb)
         
         # 对齐t_emb维度
         num_nodes = hist_emb.size(0) // t_emb.size(0)
