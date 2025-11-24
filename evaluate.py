@@ -123,32 +123,71 @@ def create_sliding_windows(data, history_len, pred_len):
 
 # --- 辅助函数：数据集类 ---
 class EVChargerDatasetV2(Dataset):
-    def __init__(self, features, history_len, pred_len, cfg, scaler=None):
+    def __init__(self, features, history_len, pred_len, cfg, scaler_y=None,scaler_mm=None,scaler_z=None):
         self.cfg = cfg
+
+        minmax_features = features[:, :, cfg.HISTORY_FEATURES-4:cfg.HISTORY_FEATURES+5].copy()
+        zscore_features = features[:, :, cfg.HISTORY_FEATURES+5:].copy()
+        
+
         dynamic_features = features[:, :, :cfg.HISTORY_FEATURES].copy()
-        self.static_features = torch.tensor(features[0, :, cfg.HISTORY_FEATURES:], dtype=torch.float)
+        static_features = features[0, :, cfg.HISTORY_FEATURES:].copy()
 
         target_col_original = dynamic_features[:, :, 0]
 
-        if scaler is None:
-            self.scaler = self._initialize_scaler(target_col_original)
+        if scaler_y is None:
+            self.scaler_y = self._initialize_scaler_y(target_col_original)
         else:
-            self.scaler = scaler
+            self.scaler_y = scaler_y
+
+        if scaler_mm is None:
+            self.scaler_mm = self._initialize_scaler_mm(minmax_features)
+        else:
+            self.scaler_mm = scaler_mm
+        
+        if scaler_z is None:
+            self.scaler_z = self._initialize_scaler_z(zscore_features)
+        else:
+            self.scaler_z = scaler_z
 
         if self.cfg.NORMALIZATION_TYPE != "none":
             target_col_reshaped = target_col_original.reshape(-1, 1)
-            normalized_target = self.scaler.transform(target_col_reshaped)
+            normalized_target = self.scaler_y.transform(target_col_reshaped)
             dynamic_features[:, :, 0] = normalized_target.reshape(target_col_original.shape)
-        
+
+        mm_norm = self.scaler_mm.transform(
+            minmax_features.reshape(-1, minmax_features.shape[-1])
+        ).reshape(minmax_features.shape)
+
+        z_norm = self.scaler_z.transform(
+            zscore_features.reshape(-1, zscore_features.shape[-1])
+        ).reshape(zscore_features.shape)
+
+
+        dynamic_features[:, :, cfg.HISTORY_FEATURES-4:] = mm_norm[:, :, :4]
+
+        static_features[:, :5] = mm_norm[0, :, -5:]
+        static_features[:, 5:] = z_norm[0, :, :]
+        self.static_features = torch.tensor(static_features, dtype=torch.float)
         self.samples = create_sliding_windows(dynamic_features, history_len, pred_len)
 
-    def _initialize_scaler(self, data):
+    def _initialize_scaler_y(self, data):
         if self.cfg.NORMALIZATION_TYPE == "minmax":
             scaler = MinMaxScaler(feature_range=(-1, 1))
         elif self.cfg.NORMALIZATION_TYPE == "zscore":
             scaler = StandardScaler()
         else: return None
         scaler.fit(data.reshape(-1, 1))
+        return scaler
+    
+    def _initialize_scaler_mm(self, data):
+        scaler = MinMaxScaler(feature_range=(-1, 1))
+        scaler.fit(data.reshape(-1, data.shape[-1]))
+        return scaler
+
+    def _initialize_scaler_z(self, data):
+        scaler = StandardScaler()
+        scaler.fit(data.reshape(-1, data.shape[-1]))
         return scaler
 
     def __len__(self):
@@ -164,7 +203,7 @@ class EVChargerDatasetV2(Dataset):
 
 
     def get_scaler(self):
-        return self.scaler
+        return self.scaler_y, self.scaler_mm, self.scaler_z
 
 # --- 辅助函数：U-Net 长度计算 ---
 def calc_layer_lengths(L_in, depth, kernel_size=3, stride=2, padding=1, dilation=1):
@@ -267,7 +306,7 @@ def dm_test(e1, e2, h=12, crit="MAD"):
 # 2. 从 train_v2.2_both.py 复制完整的 evaluate_model 函数
 # =============================================================================
 
-def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,key):
+def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_z_path, device, rank, world_size,key):
     cfg = EvalConfig()
     cfg.RUN_ID = train_cfg.RUN_ID
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
@@ -287,7 +326,9 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
     test_features = np.load(cfg.TEST_FEATURES_PATH)
-    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    scaler_y = joblib.load(scaler_y_path) if os.path.exists(scaler_y_path) else None  
+    scaler_mm = joblib.load(scaler_mm_path) if os.path.exists(scaler_mm_path) else None
+    scaler_z = joblib.load(scaler_z_path) if os.path.exists(scaler_z_path) else None
 
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
     distances = adj_matrix[adj_matrix > 0]
@@ -298,7 +339,7 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
     adj_matrix[adj_matrix < 0.1] = 0
     
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
-    test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler=scaler)
+    test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler_y=scaler_y, scaler_mm=scaler_mm, scaler_z=scaler_z)
     print(f"Test dataset size: {len(test_dataset)} samples.")
     # --- 使用 DistributedSampler 切分测试集 ---
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
@@ -391,12 +432,12 @@ def evaluate_model(train_cfg, model_path, scaler_path, device, rank, world_size,
         all_samples_norm = all_samples_norm[:, order]
 
         # 1. 在 rank 0 上进行反归一化
-        if scaler:
+        if scaler_y:
             # (B, N, L, 1) -> (B*N*L, 1) -> (B*N*L, 1) -> (B, N, L, 1)
-            all_predictions = scaler.inverse_transform(all_predictions_norm.reshape(-1, 1)).reshape(all_predictions_norm.shape)
-            y_true_original = scaler.inverse_transform(all_true_norm.reshape(-1, 1)).reshape(all_true_norm.shape)
+            all_predictions = scaler_y.inverse_transform(all_predictions_norm.reshape(-1, 1)).reshape(all_predictions_norm.shape)
+            y_true_original = scaler_y.inverse_transform(all_true_norm.reshape(-1, 1)).reshape(all_true_norm.shape)
             # (S, B, N, L, 1) -> (S*B*N*L, 1) -> (S*B*N*L, 1) -> (S, B, N, L, 1)
-            all_samples = scaler.inverse_transform(all_samples_norm.reshape(-1, 1)).reshape(all_samples_norm.shape)
+            all_samples = scaler_y.inverse_transform(all_samples_norm.reshape(-1, 1)).reshape(all_samples_norm.shape)
         else:
             all_predictions = all_predictions_norm
             y_true_original = all_true_norm
@@ -482,8 +523,10 @@ def main():
     
     # --- 构建路径 ---
     base_path = "./weights/"
-    scaler_path = os.path.join(base_path, f"scaler_v2_{run_id}.pkl")
-    
+    scaler_y_path = os.path.join(base_path, f"scaler_y_v2_{run_id}.pkl")
+    scaler_mm_path = os.path.join(base_path, f"scaler_mm_v2_{run_id}.pkl")
+    scaler_z_path = os.path.join(base_path, f"scaler_z_v2_{run_id}.pkl")
+
     models_to_evaluate = [
         {
             "name": "Best (Loss)",
@@ -509,9 +552,9 @@ def main():
     ]
 
     # 只有 Rank 0 检查 Scaler
-    if rank == 0 and not os.path.exists(scaler_path):
+    if rank == 0 and not (os.path.exists(scaler_y_path) or os.path.exists(scaler_mm_path) or os.path.exists(scaler_z_path)):
         print("="*80)
-        print(f"严重错误：Scaler 文件未找到于: {scaler_path}")
+        print(f"严重错误：Scaler 文件未找到于: {scaler_y_path}, {scaler_mm_path}, {scaler_z_path}")
         print("评估无法继续，因为反归一化是必需的。")
         print("="*80)
         # 通知其他进程退出
@@ -548,7 +591,9 @@ def main():
         metrics_result = evaluate_model(
             train_cfg=train_cfg,
             model_path=model_info['path'],
-            scaler_path=scaler_path,
+            scaler_y_path=scaler_y_path,
+            scaler_mm_path=scaler_mm_path,
+            scaler_z_path=scaler_z_path,
             device=f"cuda:{device_id}",
             rank=rank,
             world_size=world_size,

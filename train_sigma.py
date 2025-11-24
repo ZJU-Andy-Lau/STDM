@@ -119,6 +119,7 @@ class ConfigV2:
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
+    POI_FEATURES = 3
     
     # 模型参数
     MODEL_DIM = 64
@@ -130,7 +131,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 4
+    ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
@@ -258,7 +259,14 @@ class EVChargerDatasetV2(Dataset):
         future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
-        return history_c, self.static_features, future_x0, future_known_c, idx
+
+
+        static = torch.cat((self.static_features[:, 0:2], self.static_features[:, 5:]), dim=-1)
+        poi = self.static_features[:, 2:5]
+        return history_c, static, poi, future_x0, future_known_c, idx
+
+        
+        # return history_c, self.static_features, future_x0, future_known_c, idx
 
 
     def get_scaler(self):
@@ -322,10 +330,10 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
     )
 
     all_predictions_list = []
-    for (history_c, static_c, future_x0_true, future_known_c, idx) in progress_bar:
+    for (history_c, static_c, poi, future_x0_true, future_known_c, idx) in progress_bar:
         # --- 核心修改: 所有 rank 并行执行 ---
-        tensors = [d.to(device) for d in (history_c, static_c, future_x0_true, future_known_c)]
-        history_c, static_c, future_x0_true, future_known_c = tensors
+        tensors = [d.to(device) for d in (history_c, static_c, poi, future_x0_true, future_known_c)]
+        history_c, static_c, poi, future_x0_true, future_known_c = tensors
         
         b = history_c.shape[0]
         len_list = calc_layer_lengths(cfg.PRED_LEN, cfg.DEPTH)
@@ -336,6 +344,7 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
             sample = model.ddim_sample(
                 history_c=history_c.permute(0, 2, 1, 3), 
                 static_c=static_c,
+                poi=poi,
                 future_known_c=future_known_c.permute(0, 2, 1, 3),
                 history_edge_data=edge_data,
                 future_edge_data=edge_data,
@@ -472,7 +481,7 @@ def train():
 
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
-        history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES, future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM,
+        history_features=cfg.HISTORY_FEATURES+cfg.POI_FEATURES, static_features=cfg.STATIC_FEATURES-cfg.POI_FEATURES, poi_features=cfg.POI_FEATURES, future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM,
         model_dim=cfg.MODEL_DIM, num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH
     ).to(device_id)
     
@@ -540,10 +549,10 @@ def train():
         total_train_loss = 0.0
         optimizer.zero_grad()
 
-        for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
-            tensors = [d.to(device_id) for d in (history_c, static_c, future_x0, future_known_c)]
-            history_c, static_c, future_x0, future_known_c = tensors
-            
+        for i, (history_c, static_c, poi, future_x0, future_known_c, idx) in enumerate(progress_bar):
+            tensors = [d.to(device_id) for d in (history_c, static_c, poi, future_x0, future_known_c)]
+            history_c, static_c, poi, future_x0, future_known_c = tensors
+
             with amp.autocast():
                 b = future_x0.shape[0]
                 history_c_p = history_c.permute(0, 2, 1, 3)
@@ -551,13 +560,17 @@ def train():
                 future_known_c_p = future_known_c.permute(0, 2, 1, 3)
 
                 noise = torch.randn_like(future_x0_p)
+                offset_scale = 0.1
+                offset = offset_scale * torch.randn(b, 1, 1, 1, device=device_id)
+                noise = noise + offset
+
                 k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                 
                 sqrt_alpha_bar_k = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
                 sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                 x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
-                predicted_noise, predicted_logvar = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
+                predicted_noise, predicted_logvar = ddp_model(x_k, k, history_c_p, static_c, poi, future_known_c_p, edge_data, edge_data)
                 # 为数值稳定，限制 logvar 范围
                 min_logvar, max_logvar = -5.0, 3.0
                 pred_logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
@@ -588,7 +601,7 @@ def train():
         
         with torch.no_grad():
             for tensors in val_dataloader:
-                history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
+                history_c, static_c, poi, future_x0, future_known_c = [d.to(device_id) for d in tensors[:5]]
                 
                 with amp.autocast():
                     b = future_x0.shape[0]
@@ -597,6 +610,11 @@ def train():
                     future_known_c_p = future_known_c.permute(0, 2, 1, 3)
 
                     noise = torch.randn_like(future_x0_p)
+
+                    offset_scale = 0.1
+                    offset = offset_scale * torch.randn(b, 1, 1, 1, device=device_id)
+                    noise = noise + offset
+                    
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                     
                     sqrt_alpha_bar_k = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
@@ -604,7 +622,7 @@ def train():
                     x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
                     pred_noise, pred_logvar = ddp_model(
-                        x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data
+                        x_k, k, history_c_p, static_c, poi, future_known_c_p, edge_data, edge_data
                     )
 
                     min_logvar, max_logvar = -5.0, 3.0
@@ -926,7 +944,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
-        history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES,
+        history_features=cfg.HISTORY_FEATURES+cfg.POI_FEATURES, static_features=cfg.STATIC_FEATURES-cfg.POI_FEATURES, poi_features=cfg.POI_FEATURES,
         future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM, model_dim=cfg.MODEL_DIM,
         num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH
     ).to(cfg.DEVICE)
@@ -963,9 +981,10 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
-            history_c, static_c, future_x0_true, future_known_c, idx = tensors
+            history_c, static_c, poi, future_x0_true, future_known_c, idx = tensors
             history_c = history_c.to(cfg.DEVICE)
             static_c = static_c.to(cfg.DEVICE)
+            poi = poi.to(cfg.DEVICE)
             future_x0_true = future_x0_true.to(cfg.DEVICE)
             future_known_c = future_known_c.to(cfg.DEVICE)
 
@@ -979,7 +998,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
             generated_samples = []
             for _ in range(cfg.NUM_SAMPLES):
                 sample = model.ddim_sample(
-                    history_c=history_c.permute(0, 2, 1, 3), static_c=static_c,
+                    history_c=history_c.permute(0, 2, 1, 3), static_c=static_c, poi=poi,
                     future_known_c=future_known_c.permute(0, 2, 1, 3),
                     history_edge_data=edge_data,
                     future_edge_data=edge_data,

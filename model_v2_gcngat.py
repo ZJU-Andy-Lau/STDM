@@ -224,7 +224,7 @@ class ContextEncoder(nn.Module):
             hidden_size=model_dim,
             num_layers=2,
             batch_first=True,
-            dropout=0.05
+            # dropout=0.05
         )
         
         # <<< 修改：融合MLP的输入维度增加 >>>
@@ -232,9 +232,9 @@ class ContextEncoder(nn.Module):
         self.fusion_mlp = nn.Sequential(
             nn.Linear(fusion_input_dim, context_dim),
             nn.Mish(),
-            nn.Dropout(0.05),
+            # nn.Dropout(0.05),
             nn.Linear(context_dim, context_dim),
-            nn.Dropout(0.05)
+            # nn.Dropout(0.05)
         )
 
     def forward(self, k, history_c, static_c, future_known_c, edge_data):
@@ -260,7 +260,7 @@ class ContextEncoder(nn.Module):
         _, future_hidden_state = self.future_encoder(future_known_c)
         # 取最后一层的隐藏状态作为总结
         future_emb = future_hidden_state[-1]
-        future_emb = self.dropout(future_emb)
+        # future_emb = self.dropout(future_emb)
         
         # 对齐t_emb维度
         num_nodes = hist_emb.size(0) // t_emb.size(0)

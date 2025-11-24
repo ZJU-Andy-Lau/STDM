@@ -222,7 +222,7 @@ class ContextEncoder(nn.Module):
             hidden_size=model_dim,
             num_layers=2,
             batch_first=True,
-            dropout=0.05
+            # dropout=0.05
         )
         self.dropout = nn.Dropout(0.05)
         # <<< 修改：融合MLP的输入维度增加 >>>
@@ -230,9 +230,9 @@ class ContextEncoder(nn.Module):
         self.fusion_mlp = nn.Sequential(
             nn.Linear(fusion_input_dim, context_dim),
             nn.Mish(),
-            nn.Dropout(0.05),
+            # nn.Dropout(0.05),
             nn.Linear(context_dim, context_dim),
-            nn.Dropout(0.05)
+            # nn.Dropout(0.05)
         )
 
     def forward(self, k, history_c, static_c, future_known_c, edge_data):
@@ -259,7 +259,7 @@ class ContextEncoder(nn.Module):
         # 取最后一层的隐藏状态作为总结
         future_emb = future_hidden_state[-1]
 
-        future_emb = self.dropout(future_emb)
+        # future_emb = self.dropout(future_emb)
         
         # 对齐t_emb维度
         num_nodes = hist_emb.size(0) // t_emb.size(0)
@@ -362,11 +362,17 @@ class UGnetV2(nn.Module):
 
 class SpatioTemporalDiffusionModelV2(nn.Module):
     """完整的V2.5版时空扩散模型。"""
-    def __init__(self, in_features, out_features, history_features, static_features, future_known_features, model_dim, num_heads, T=1000,depth=2):
+    def __init__(self, in_features, out_features, history_features, static_features, poi_features, future_known_features, model_dim, num_heads, T=1000,depth=2):
         super().__init__()
         self.T = T
         self.out_features = out_features
         
+        # self.poi_mlp = nn.Sequential(
+        #     nn.Linear(poi_features, model_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(model_dim, model_dim)
+        # )
+
         context_dim = model_dim * 4
         self.context_encoder = ContextEncoder(
             time_dim=model_dim, 
@@ -411,10 +417,15 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.register_buffer('posterior_variance', posterior_variance)
 
-    def forward(self, x_k, k, history_c, static_c, future_known_c, history_edge_data, future_edge_data):
+    def forward(self, x_k, k, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data):
         batch_size, num_nodes, _, _ = x_k.shape
         
         history_c_flat = history_c.reshape(batch_size * num_nodes, history_c.shape[2], -1)
+
+        
+        poi = poi.unsqueeze(2).repeat(1, 1, history_c.shape[2], 1)
+        history_c_flat = torch.cat([history_c_flat, poi.reshape(batch_size * num_nodes, history_c.shape[2], -1)], dim=-1)
+
         future_known_c_flat = future_known_c.reshape(batch_size * num_nodes, future_known_c.shape[2], -1)
         
         if static_c.dim() == 3 and static_c.shape[0] == batch_size:
@@ -433,7 +444,8 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
         return predicted_noise, predicted_logvar
 
     @torch.no_grad()
-    def ddim_sample(self, history_c, static_c, future_known_c, history_edge_data, future_edge_data, shape, sampling_steps=50, eta=0.0):
+    def ddim_sample(self, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data, shape, sampling_steps=50, eta=0.0):
+        
         device = self.betas.device
         b, n, l, _ = shape
         
@@ -451,7 +463,7 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             # <<< 核心修改：将两个edge_index列表传入self.forward >>>
             # predicted_noise = self.forward(x_k, k_tensor, history_c, static_c, history_edge_indices, future_edge_indices)
             predicted_noise, predicted_logvar = self.forward(
-                x_k, k_tensor, history_c, static_c, future_known_c, history_edge_data, future_edge_data
+                x_k, k_tensor, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data
             )
 
             alpha_cumprod_t = self.alphas_cumprod[t_current] if t_current >= 0 else torch.tensor(1.0, device=device)
@@ -463,8 +475,15 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             min_logvar, max_logvar = -5.0, 3.0   # 可微调
             logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
     
-            var_scale = 1.0  
+            var_scale = 1.2  
             sigma_t = eta * torch.exp(0.5 * logvar) * var_scale
+
+            # if eta > 0 and t_prev >= 0:
+            #     # 计算方差系数 (标准 DDIM 方差公式)
+            #     variance = (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+            #     sigma_t = eta * torch.sqrt(variance)
+            # else:
+            #     sigma_t = torch.tensor(0.0, device=device)
 
             # 4) 限制 sigma_t^2 不超过 (1 - alpha_cumprod_t_prev)
             max_sigma_sq = (1. - alpha_cumprod_t_prev - 1e-5).clamp(min=1e-5)  # 标量 → 自动广播
@@ -478,7 +497,17 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             x_prev = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + pred_dir_xt
 
             if eta > 0:
-                x_prev = x_prev + torch.sqrt(sigma_sq) * torch.randn_like(x_k)
+                eps = torch.randn_like(x_k)
+
+                # ====== ⭐ 在此加入偏移噪声 Offset-Noise ⭐ ======
+                offset_scale = 0.2  # 你可以调成 0.1~0.3
+                offset = offset_scale * torch.randn(b, 1, 1, 1, device=device)
+                eps = eps + offset
+                # ==================================================
+
+                x_prev = x_prev + torch.sqrt(sigma_sq) * eps
+
+                # x_prev = x_prev + torch.sqrt(sigma_sq) * torch.randn_like(x_k)
                 
             x_k = x_prev
 

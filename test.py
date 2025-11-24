@@ -6,7 +6,7 @@ from model_sigma import SpatioTemporalDiffusionModelV2
 # ==========================
 # 加载模型权重路径
 # ==========================
-model_path = "./weights/st_diffusion_model_v2_20251122_163129_mae_best.pth"   # ← 修改这里
+model_path = "./weights/st_diffusion_model_v2_20251123_220353_mae_best.pth"   # ← 修改这里
 
 # ==========================
 # 模型结构必须和训练时一致

@@ -113,8 +113,8 @@ class ConfigV2:
     
     # 特征维度定义
     TARGET_FEAT_DIM = 1
-    DYNAMIC_FEAT_DIM = 12
-    STATIC_FEAT_DIM = 7
+    DYNAMIC_FEAT_DIM = 15
+    STATIC_FEAT_DIM = 4
     FUTURE_KNOWN_FEAT_DIM = 13
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
@@ -130,7 +130,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 4
+    ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      # 预热阶段的 Epoch 数量
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
@@ -182,9 +182,12 @@ def create_sliding_windows(data, history_len, pred_len):
 class EVChargerDatasetV2(Dataset):
     def __init__(self, features, history_len, pred_len, cfg, scaler=None):
         self.cfg = cfg
-        dynamic_features = features[:, :, :cfg.HISTORY_FEATURES].copy()
-        self.static_features = torch.tensor(features[0, :, cfg.HISTORY_FEATURES:], dtype=torch.float)
+        dynamic_features = features[:, :, :cfg.HISTORY_FEATURES-3].copy()
+        dynamic_features = np.concatenate([dynamic_features, features[:, :,-3:].copy()], axis=-1)
 
+        self.static_features = torch.tensor(features[0, :, cfg.HISTORY_FEATURES-3:-3], dtype=torch.float)
+
+        
         target_col_original = dynamic_features[:, :, 0]
 
         if scaler is None:
@@ -386,7 +389,6 @@ def train():
 
     train_features = np.load(cfg.TRAIN_FEATURES_PATH)
     val_features = np.load(cfg.VAL_FEATURES_PATH)
-    
     train_dataset = EVChargerDatasetV2(train_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_dataloader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, sampler=train_sampler, drop_last=True, pin_memory=True, num_workers=4)
@@ -774,7 +776,7 @@ def train():
 
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 40
+    NUM_SAMPLES = 20
     SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
