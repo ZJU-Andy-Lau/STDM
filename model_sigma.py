@@ -259,7 +259,7 @@ class ContextEncoder(nn.Module):
         # 取最后一层的隐藏状态作为总结
         future_emb = future_hidden_state[-1]
 
-        # future_emb = self.dropout(future_emb)
+        future_emb = self.dropout(future_emb)
         
         # 对齐t_emb维度
         num_nodes = hist_emb.size(0) // t_emb.size(0)
