@@ -30,7 +30,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, CosineAnnealingWarmRestarts
 
 # 从您工作区中的 model_v2.py 导入 V2 模型
-from model_sigma import SpatioTemporalDiffusionModelV2
+from model_crps import SpatioTemporalDiffusionModelV2
 
 from scheduler import MultiStageOneCycleLR
 
