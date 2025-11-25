@@ -1,4 +1,5 @@
 import warnings
+from datetime import timedelta
 warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ from contextlib import nullcontext
 import math
 import random
 import csv  # [新增] 导入 csv 模块用于日志记录
+import time
 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
@@ -100,6 +102,34 @@ class CsvLogger:
                 
         except Exception as e:
             print(f"[Rank 0 Logger Error] Failed to log epoch data: {e}")
+
+def save_with_retry(save_func, obj, path, retries=1000, delay=30):
+    """
+    带重试机制的保存函数。
+    
+    参数:
+        save_func: 保存函数 (如 torch.save, joblib.dump, np.save)
+        obj: 要保存的对象
+        path: 保存路径
+        retries: 重试次数 (默认10次)
+        delay: 每次重试的等待秒数 (默认60秒，给你时间清理空间)
+    """
+    for i in range(retries):
+        try:
+            save_func(obj, path)
+            # 只有 rank 0 会调用这个，所以打印出来没问题
+            # print(f"Successfully saved to {path}") 
+            return
+        except OSError as e:
+            print(f"\n[Warning] Failed to save {path} (Attempt {i+1}/{retries}). Error: {e}")
+            if "No space left on device" in str(e) or "Disk quota exceeded" in str(e):
+                print(f"⚠️ DISK FULL! Waiting {delay} seconds for you to clear space...")
+            else:
+                print(f"Waiting {delay} seconds before retry...")
+            time.sleep(delay)
+    
+    print(f"\n[CRITICAL ERROR] Could not save {path} after {retries} attempts. Losing data.")
+
 
 # --- V2 版本配置参数 (已修改以对齐V2.3) ---
 class ConfigV2:
@@ -378,7 +408,7 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
 
 # --- 主训练函数 (已修改) ---
 def train():
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timedelta(hours=3))
     rank = int(os.environ["RANK"])
     device_id = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -450,9 +480,12 @@ def train():
 
     if rank == 0 and cfg.NORMALIZATION_TYPE != "none":
         scaler_y, scaler_mm, scaler_z = train_dataset.get_scaler()
-        joblib.dump(scaler_y, scaler_y_save_path)
-        joblib.dump(scaler_mm, scaler_mm_save_path)
-        joblib.dump(scaler_z, scaler_z_save_path)
+        # joblib.dump(scaler_y, scaler_y_save_path)
+        # joblib.dump(scaler_mm, scaler_mm_save_path)
+        # joblib.dump(scaler_z, scaler_z_save_path)
+        save_with_retry(joblib.dump, scaler_y, scaler_y_save_path)
+        save_with_retry(joblib.dump, scaler_mm, scaler_mm_save_path)
+        save_with_retry(joblib.dump, scaler_z, scaler_z_save_path)
     dist.barrier()
 
     train_y_scaler = joblib.load(scaler_y_save_path) if os.path.exists(scaler_y_save_path) else None
@@ -614,7 +647,7 @@ def train():
                     offset_scale = 0.1
                     offset = offset_scale * torch.randn(b, 1, 1, 1, device=device_id)
                     noise = noise + offset
-                    
+
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                     
                     sqrt_alpha_bar_k = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
@@ -664,13 +697,14 @@ def train():
                     os.rename(best_model_path_for_val, model_save_path_second_best)
                     print(f"Model {os.path.basename(best_model_path_for_val)} promoted to 2nd best.")
                     second_best_model_path_for_val = model_save_path_second_best
-                torch.save(ddp_model.module.state_dict(), model_save_path_best)
+                # torch.save(ddp_model.module.state_dict(), model_save_path_best)
+                save_with_retry(torch.save, ddp_model.module.state_dict(), model_save_path_best)
                 best_model_path_for_val = model_save_path_best
                 print(f"🎉 New best model saved to {model_save_path_best} with validation loss: {best_val_loss:.4f}")
             
             elif avg_val_loss < second_best_val_loss:
                 second_best_val_loss = avg_val_loss
-                torch.save(ddp_model.module.state_dict(), model_save_path_second_best)
+                # save_with_retry(torch.save, ddp_model.module.state_dict(), model_save_path_second_best)
                 second_best_model_path_for_val = model_save_path_second_best
                 print(f"🥈 New 2nd best model saved to {model_save_path_second_best} with validation loss: {second_best_val_loss:.4f}")
 
@@ -725,13 +759,15 @@ def train():
                         second_best_model_path_for_eval = model_save_path_mae_second_best
 
                     best_val_mae = current_val_mae
-                    torch.save(ddp_model.module.state_dict(), model_save_path_mae_best)
+                    # torch.save(ddp_model.module.state_dict(), model_save_path_mae_best)
+                    save_with_retry(torch.save, ddp_model.module.state_dict(), model_save_path_mae_best)
                     best_model_path_for_eval = model_save_path_mae_best
                     print(f"🎉 New best model saved to {model_save_path_mae_best} with validation MAE: {best_val_mae:.4f}")
 
                 elif current_val_mae < second_best_val_mae:
                     second_best_val_mae = current_val_mae
-                    torch.save(ddp_model.module.state_dict(), model_save_path_mae_second_best)
+                    # torch.save(ddp_model.module.state_dict(), model_save_path_mae_second_best)
+                    save_with_retry(torch.save, ddp_model.module.state_dict(), model_save_path_mae_second_best)
                     second_best_model_path_for_eval = model_save_path_mae_second_best
                     print(f"🥈 New 2nd best model saved to {model_save_path_mae_second_best} with validation MAE: {second_best_val_mae:.4f}")
 
@@ -1089,9 +1125,12 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
         print(f"all_predictions shape:{all_predictions.shape}")
         print(f"all_samples shape:{all_samples.shape}")
 
-        np.save(f'./results/truths.npy', y_true_original)
-        np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
-        np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
+        # np.save(f'./results/truths.npy', y_true_original)
+        # np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
+        # np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
+
+        save_with_retry(np.save, f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
+        save_with_retry(np.save, f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
         try:
             # 注意：这个基线文件路径是硬编码的
@@ -1117,9 +1156,11 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
             dm_statistic, p_value = dm_test(errors_baseline, errors_model)
             final_metrics['dm_stat'] = dm_statistic
             final_metrics['p_value'] = p_value
-            
+        
+        dist.barrier()
         return final_metrics
     else:
+        dist.barrier()
         return None
 
 if __name__ == "__main__":

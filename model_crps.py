@@ -230,9 +230,9 @@ class ContextEncoder(nn.Module):
         self.fusion_mlp = nn.Sequential(
             nn.Linear(fusion_input_dim, context_dim),
             nn.Mish(),
-            # nn.Dropout(0.05),
+            nn.Dropout(0.05),
             nn.Linear(context_dim, context_dim),
-            # nn.Dropout(0.05)
+            nn.Dropout(0.05)
         )
 
     def forward(self, k, history_c, static_c, future_known_c, edge_data):
@@ -470,44 +470,29 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             alpha_cumprod_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
             
             pred_x0 = (x_k - torch.sqrt(1. - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
-            # sigma_t = eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev))
+            if eta > 0 and t_prev >= 0:
+                # 标准公式：计算后验分布的方差
+                variance = (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+                sigma_t = eta * torch.sqrt(variance)
+            else:
+                sigma_t = torch.tensor(0.0, device=device)
+                
+            # 2. 计算指向 xt 的方向 (Deterministic direction)
+            # 确保根号内非负
+            sigma_sq = sigma_t ** 2
+            max_sigma_sq = (1. - alpha_cumprod_t_prev).clamp(min=0.0)
+            sigma_sq = torch.clamp(sigma_sq, max=max_sigma_sq) # 再次截断以防数值误差
             
-            min_logvar, max_logvar = -5.0, 3.0   # 可微调
-            logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
-    
-            var_scale = 1.2  
-            sigma_t = eta * torch.exp(0.5 * logvar) * var_scale
-
-            # if eta > 0 and t_prev >= 0:
-            #     # 计算方差系数 (标准 DDIM 方差公式)
-            #     variance = (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
-            #     sigma_t = eta * torch.sqrt(variance)
-            # else:
-            #     sigma_t = torch.tensor(0.0, device=device)
-
-            # 4) 限制 sigma_t^2 不超过 (1 - alpha_cumprod_t_prev)
-            max_sigma_sq = (1. - alpha_cumprod_t_prev - 1e-5).clamp(min=1e-5)  # 标量 → 自动广播
-            sigma_sq = torch.clamp(sigma_t**2, max=max_sigma_sq)
-
-            # 5) 计算 pred_dir_xt 时，确保 sqrt 里非负
             coeff = torch.sqrt((1. - alpha_cumprod_t_prev - sigma_sq).clamp(min=0.0))
             pred_dir_xt = coeff * predicted_noise
 
-            # 6) 合成 x_{t-1}
+            # 3. 合成 x_{t-1}
             x_prev = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + pred_dir_xt
 
-            if eta > 0:
+            # 4. 注入随机噪声 (Stochastic noise injection)
+            if eta > 0 and t_prev >= 0:
                 eps = torch.randn_like(x_k)
-
-                # ====== ⭐ 在此加入偏移噪声 Offset-Noise ⭐ ======
-                offset_scale = 0.3  # 你可以调成 0.1~0.3
-                offset = offset_scale * torch.randn(b, 1, 1, 1, device=device)
-                eps = eps + offset
-                # ==================================================
-
-                x_prev = x_prev + torch.sqrt(sigma_sq) * eps
-
-                # x_prev = x_prev + torch.sqrt(sigma_sq) * torch.randn_like(x_k)
+                x_prev = x_prev + sigma_t * eps
                 
             x_k = x_prev
 
