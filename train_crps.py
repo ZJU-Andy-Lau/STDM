@@ -103,7 +103,7 @@ class CsvLogger:
         except Exception as e:
             print(f"[Rank 0 Logger Error] Failed to log epoch data: {e}")
 
-def save_with_retry(save_func, obj, path, retries=10, delay=60):
+def save_with_retry(save_func, obj, path, retries=1000, delay=30):
     """
     带重试机制的保存函数。
     
