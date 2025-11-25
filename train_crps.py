@@ -120,13 +120,27 @@ def save_with_retry(save_func, obj, path, retries=1000, delay=30):
             # 只有 rank 0 会调用这个，所以打印出来没问题
             # print(f"Successfully saved to {path}") 
             return
-        except OSError as e:
-            print(f"\n[Warning] Failed to save {path} (Attempt {i+1}/{retries}). Error: {e}")
-            if "No space left on device" in str(e) or "Disk quota exceeded" in str(e):
-                print(f"⚠️ DISK FULL! Waiting {delay} seconds for you to clear space...")
+        except (OSError, RuntimeError) as e:
+            error_msg = str(e)
+            
+            # --- 关键判断：只有当错误是“写入失败”或“空间不足”时才重试 ---
+            # PyTorch 抛出的错误通常包含 "file write failed" 或 "write file data"
+            is_disk_error = "failed writing" in error_msg or "No space left" in error_msg or "Disk quota exceeded" in error_msg
+            
+            # 如果是 PyTorch 的 RuntimeError 且不是磁盘问题，我们应该让它抛出（比如显存不足等）
+            if isinstance(e, RuntimeError) and not is_disk_error:
+                raise e
+
+            print(f"\n[Warning] Failed to save {path} (Attempt {i+1}/{retries}).")
+            print(f"Error Details: {e}")
+            
+            if is_disk_error:
+                print(f"⚠️ DISK PROBABLY FULL! Waiting {delay} seconds for you to clear space...")
             else:
                 print(f"Waiting {delay} seconds before retry...")
+            
             time.sleep(delay)
+            
     
     print(f"\n[CRITICAL ERROR] Could not save {path} after {retries} attempts. Losing data.")
 
