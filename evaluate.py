@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 # --- 导入模型 ---
 # 确保 model_v2_gcngat.py 在同一个目录下
 try:
-    from model_sigma import SpatioTemporalDiffusionModelV2
+    from model_crps import SpatioTemporalDiffusionModelV2
 except ImportError:
     print("错误：无法导入 'model_v2_gcngat.py'。")
     print("请确保 'model_v2_gcngat.py' 文件与此脚本在同一目录中。")
@@ -368,7 +368,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
 
             generated_samples = []
             for _ in range(cfg.NUM_SAMPLES):
-                sample = model.ddim_sample(
+                sample = model.ddpm_sample(
                     history_c=history_c.permute(0, 2, 1, 3), static_c=static_c,
                     future_known_c=future_known_c.permute(0, 2, 1, 3),
                     history_edge_data=edge_data,

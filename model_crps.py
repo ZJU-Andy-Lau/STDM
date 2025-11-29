@@ -444,56 +444,48 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
         return predicted_noise, predicted_logvar
 
     @torch.no_grad()
-    def ddim_sample(self, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data, shape, sampling_steps=50, eta=0.0):
-        
+    def ddpm_sample(self, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data, shape):
+        """
+        标准的 DDPM (Ancestral Sampling) 采样实现。
+        通过每一步注入随机噪声来保证生成分布的多样性，解决 Mode Collapse 问题。
+        """
         device = self.betas.device
         b, n, l, _ = shape
         
-        time_steps = torch.linspace(-int(1), self.T - 1, steps=sampling_steps + 1).round().to(torch.long)
-        time_steps = list(reversed(time_steps.tolist()))
-        
-        x_k = torch.randn(shape, device=device)
+        # 1. Start from pure Gaussian noise (从标准正态分布开始)
+        x = torch.randn(shape, device=device)
 
-        for i in tqdm(range(sampling_steps), desc="DDIM Sampling", leave=False, ncols=100,disable=True):
-            t_current = time_steps[i]
-            t_prev = time_steps[i+1]
+        # 2. Denoise loop (反向去噪过程：从 T-1 到 0)
+        # 必须跑完完整的 self.T 步，不能跳步
+        for t in tqdm(reversed(range(0, self.T)), desc="DDPM Sampling", total=self.T, leave=False, ncols=100):
+            t_tensor = torch.full((b,), t, device=device, dtype=torch.long)
             
-            k_tensor = torch.full((b,), t_current, device=device, dtype=torch.long)
-            
-            # <<< 核心修改：将两个edge_index列表传入self.forward >>>
-            # predicted_noise = self.forward(x_k, k_tensor, history_c, static_c, history_edge_indices, future_edge_indices)
-            predicted_noise, predicted_logvar = self.forward(
-                x_k, k_tensor, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data
+            # 预测噪声 (Predict noise epsilon_theta)
+            predicted_noise, _ = self.forward(
+                x, t_tensor, history_c, static_c, poi, future_known_c, history_edge_data, future_edge_data
             )
-
-            alpha_cumprod_t = self.alphas_cumprod[t_current] if t_current >= 0 else torch.tensor(1.0, device=device)
-            alpha_cumprod_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
             
-            pred_x0 = (x_k - torch.sqrt(1. - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
-            if eta > 0 and t_prev >= 0:
-                # 标准公式：计算后验分布的方差
-                variance = (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
-                sigma_t = eta * torch.sqrt(variance)
+            # --- DDPM 核心更新公式 ---
+            # x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-alpha_bar_t) * eps) + sigma_t * z
+            
+            beta_t = self.betas[t]
+            sqrt_recip_alpha_t = self.sqrt_recip_alphas[t]
+            sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t]
+            
+            # 计算均值 mu_theta(x_t, t)
+            pred_mean = sqrt_recip_alpha_t * (x - beta_t * predicted_noise / sqrt_one_minus_alpha_cumprod_t)
+            
+            # 注入噪声 (Stochastic noise injection)
+            if t > 0:
+                # 使用后验方差 posterior_variance (计算自 beta_t 和 alpha_bar)
+                # 这种方式在数学上等价于 sigma_t^2 = beta_t (Ho et al.) 但在小步长下更稳定
+                variance = self.posterior_variance[t]
+                std_dev = torch.sqrt(variance)
+                
+                noise = torch.randn_like(x)
+                x = pred_mean + std_dev * noise
             else:
-                sigma_t = torch.tensor(0.0, device=device)
+                # 最后一步 t=0 不加噪声
+                x = pred_mean
                 
-            # 2. 计算指向 xt 的方向 (Deterministic direction)
-            # 确保根号内非负
-            sigma_sq = sigma_t ** 2
-            max_sigma_sq = (1. - alpha_cumprod_t_prev).clamp(min=0.0)
-            sigma_sq = torch.clamp(sigma_sq, max=max_sigma_sq) # 再次截断以防数值误差
-            
-            coeff = torch.sqrt((1. - alpha_cumprod_t_prev - sigma_sq).clamp(min=0.0))
-            pred_dir_xt = coeff * predicted_noise
-
-            # 3. 合成 x_{t-1}
-            x_prev = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + pred_dir_xt
-
-            # 4. 注入随机噪声 (Stochastic noise injection)
-            if eta > 0 and t_prev >= 0:
-                eps = torch.randn_like(x_k)
-                x_prev = x_prev + sigma_t * eps
-                
-            x_k = x_prev
-
-        return x_k
+        return x
