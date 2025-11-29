@@ -16,7 +16,7 @@ import properscoring as ps
 from contextlib import nullcontext
 import math
 import random
-import csv  # [新增] 导入 csv 模块用于日志记录
+import csv 
 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, CosineAnnealingWarmRestarts
 
-# 从您工作区中的 model_v2.py 导入 V2 模型
+# 从您工作区中的 model_sigma.py 导入 V2 模型
 from model_sigma import SpatioTemporalDiffusionModelV2
 
 from scheduler import MultiStageOneCycleLR
@@ -101,7 +101,7 @@ class CsvLogger:
         except Exception as e:
             print(f"[Rank 0 Logger Error] Failed to log epoch data: {e}")
 
-# --- V2 版本配置参数 (已修改以对齐V2.3) ---
+# --- V2 版本配置参数 ---
 class ConfigV2:
     NORMALIZATION_TYPE = "minmax" 
     RUN_ID = None 
@@ -126,9 +126,14 @@ class ConfigV2:
     DEPTH = 4
     T = 1000
     
+    # --- [核心修改] 集成训练参数 ---
+    ENSEMBLE_K = 4          # 对于每个样本，生成 K 个不同的预测
+    ENSEMBLE_LAMBDA = 1.0   # 集成损失的权重
+    LOGVAR_LAMBDA = 0.1     # 原始 LogVar 辅助损失的权重 (防止 LogVar 分支坍缩)
+    
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size
+    BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size。实际输入到模型的 batch 会变为 BATCH_SIZE * ENSEMBLE_K
     LEARNING_RATE = 1e-4
     ACCUMULATION_STEPS = 4
 
@@ -136,7 +141,7 @@ class ConfigV2:
     COOLDOWN_EPOCHS = 50    # 退火阶段的 Epoch 数量
     CYCLE_EPOCHS = 10    # 每个余弦退火周期的 Epoch 数量 (T_0)
     
-    # --- 核心修改1: 修改文件路径模板以保存最佳和次佳模型 ---
+    # 文件路径模板
     MODEL_SAVE_PATH_TEMPLATE = "./weights/st_diffusion_model_v2_{run_id}_{rank}.pth"
     SCALER_Y_SAVE_PATH_TEMPLATE = "./weights/scaler_y_v2_{run_id}.pkl"
     SCALER_MM_SAVE_PATH_TEMPLATE = "./weights/scaler_mm_v2_{run_id}.pkl"
@@ -145,7 +150,7 @@ class ConfigV2:
     # --- 周期性 MAE 评估的配置 ---
     EVAL_ON_VAL = True               # 是否开启周期性 MAE 评估
     EVAL_ON_VAL_EPOCH = 5            # 每 5 个 epoch 运行一次
-    EVAL_ON_VAL_BATCHES = 48         # 使用 48 个 batch 进行评估 (48 * BATCH_SIZE=192 个样本)
+    EVAL_ON_VAL_BATCHES = 48         # 使用 48 个 batch 进行评估
     EVAL_ON_VAL_SAMPLES = 5          # 评估时生成 5 个样本
     EVAL_ON_VAL_STEPS = 20           # 评估时使用 20 步采样 (为了速度)
     SAMPLING_ETA = 0.0               # 评估时使用 DDIM (eta=0.0)
@@ -153,7 +158,7 @@ class ConfigV2:
 
     # 数据文件路径
     TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi.npy'
-    VAL_FEATURES_PATH = './urbanev/features_valid_wea_poi.npy' # 暂时尝试将测试集作为验证集
+    VAL_FEATURES_PATH = './urbanev/features_valid_wea_poi.npy'
     TEST_FEATURES_PATH = './urbanev/features_test_wea_poi.npy'
     ADJ_MATRIX_PATH = './urbanev/dis.npy'
 
@@ -265,20 +270,6 @@ class EVChargerDatasetV2(Dataset):
         return self.scaler_y, self.scaler_mm, self.scaler_z
 
 def calc_layer_lengths(L_in, depth, kernel_size=3, stride=2, padding=1, dilation=1):
-    """
-    根据Conv1d参数计算每一层的输出长度
-    
-    参数：
-        L_in : int      # 初始序列长度
-        depth : int     # 网络层数（下采样层数）
-        kernel_size : int
-        stride : int
-        padding : int
-        dilation : int
-        
-    返回：
-        lengths : list[int]  # 每一层的输出长度（包含输入层）
-    """
     lengths = [L_in]
     for i in range(depth):
         L_prev = lengths[-1]
@@ -301,29 +292,26 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-# --- 新增修改: 周期性 MAE 评估函数 ---
+# --- 周期性 MAE 评估函数 ---
 @torch.no_grad()
 def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, device):
     """
     在验证集子集上运行 MAE 评估。
     此函数只应在 rank 0 上调用。
     """
-    # set_seed(cfg.EVAL_SEED)
-    model.eval() # 确保模型处于评估模式
+    model.eval() 
     
-    # --- 核心修改: 获取 rank 以便只在 rank 0 上显示 tqdm ---
     rank = dist.get_rank()
     
     progress_bar = tqdm(
         loader, 
         desc=f"Periodic Val MAE (Rank {rank})", 
-        disable=(rank != 0), # 只在 rank 0 上显示
+        disable=(rank != 0), 
         ncols=100
     )
 
     all_predictions_list = []
     for (history_c, static_c, future_x0_true, future_known_c, idx) in progress_bar:
-        # --- 核心修改: 所有 rank 并行执行 ---
         tensors = [d.to(device) for d in (history_c, static_c, future_x0_true, future_known_c)]
         history_c, static_c, future_x0_true, future_known_c = tensors
         
@@ -340,34 +328,31 @@ def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, 
                 history_edge_data=edge_data,
                 future_edge_data=edge_data,
                 shape=future_x0_true.permute(0, 2, 1, 3).shape, 
-                sampling_steps=cfg.EVAL_ON_VAL_STEPS, # 使用更少的步数以加速
-                eta=cfg.SAMPLING_ETA # 确保使用 eta=0.0
+                sampling_steps=cfg.EVAL_ON_VAL_STEPS, 
+                eta=cfg.SAMPLING_ETA 
             )
             generated_samples.append(sample)
         
         stacked_samples = torch.stack(generated_samples, dim=0)
         median_prediction = torch.median(stacked_samples, dim=0).values
 
-        # 反归一化以计算真实 MAE
         denorm_pred = median_prediction.cpu().numpy()
         denorm_true = future_x0_true.permute(0, 2, 1, 3).cpu().numpy()
         if scaler:
             denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
             denorm_true = scaler.inverse_transform(denorm_true.reshape(-1, 1)).reshape(denorm_true.shape)
 
-        denorm_pred = np.clip(denorm_pred, 0.0, 1.0)  # 截断预测值
+        denorm_pred = np.clip(denorm_pred, 0.0, 1.0) 
 
         all_predictions_list.append(denorm_pred)
 
 
-    model.train() # 评估后将模型设置回训练模式
-    
-    # --- 核心修改: 返回局部的(local)结果 ---
+    model.train() 
     return np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
 
 
 
-# --- 主训练函数 (已修改) ---
+# --- 主训练函数 ---
 def train():
     dist.init_process_group("nccl")
     rank = int(os.environ["RANK"])
@@ -377,11 +362,11 @@ def train():
 
     cfg = ConfigV2()
 
-    # --- 核心修改2: 初始化最佳/次佳模型跟踪变量 (仅主进程) ---
+    # --- 初始化变量 ---
     if rank == 0:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         cfg.RUN_ID = run_id
-        print(f"Starting DDP training. Run ID: {cfg.RUN_ID}")
+        print(f"Starting DDP training with Ensemble-K={cfg.ENSEMBLE_K}. Run ID: {cfg.RUN_ID}")
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
         model_save_path_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="best")
@@ -411,13 +396,12 @@ def train():
         scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
         scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
 
-    # --- [新功能] 1. 初始化日志记录器 ---
-    # 定义日志表头
+    # --- 日志 ---
     log_headers = ['epoch', 'avg_train_loss', 'avg_val_loss', 'lr', 'avg_val_mae']
     csv_logger = CsvLogger(
-        log_dir='./results',  # 指定日志目录
-        run_id=cfg.RUN_ID,    # 使用全局唯一的 run_id
-        rank=rank,            # 传入当前进程的 rank
+        log_dir='./results', 
+        run_id=cfg.RUN_ID,  
+        rank=rank,          
         headers=log_headers
     )
 
@@ -425,7 +409,6 @@ def train():
     distances = adj_matrix[adj_matrix > 0]
     sigma = np.std(distances)
 
-    # 应用高斯核函数
     adj_matrix = np.exp(-np.square(adj_matrix) / (sigma**2))
     adj_matrix[adj_matrix < 0.1] = 0
 
@@ -454,7 +437,6 @@ def train():
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=cfg.BATCH_SIZE, sampler=val_sampler, drop_last=True, pin_memory=True, num_workers=4)
     
-    
     val_eval_indices = list(range(len(val_dataset)))
     val_eval_indices_subset = val_eval_indices[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
     val_eval_dataset = Subset(val_dataset, val_eval_indices_subset)
@@ -468,8 +450,6 @@ def train():
         sampler=val_eval_sampler
     )
 
-
-
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
         history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES, future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM,
@@ -479,30 +459,7 @@ def train():
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=False)
 
     optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
-    # criterion = nn.MSELoss()
-    # criterion = nn.HuberLoss()
     scaler = amp.GradScaler()
-
-    # warmup_scheduler = LambdaLR(
-    #     optimizer,
-    #     lr_lambda=lambda epoch: (epoch + 1) / cfg.WARMUP_EPOCHS if epoch < cfg.WARMUP_EPOCHS else 1
-    # )
-
-    # main_scheduler = CosineAnnealingWarmRestarts(
-    #     optimizer,
-    #     T_0=cfg.CYCLE_EPOCHS,
-    #     T_mult=1,
-    #     eta_min=1e-6
-    # )
-
-    # scheduler = SequentialLR(
-    #     optimizer,
-    #     schedulers=[warmup_scheduler, main_scheduler],
-    #     milestones=[cfg.WARMUP_EPOCHS]
-    # )
-
-
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=1e-6)
 
     scheduler = MultiStageOneCycleLR(optimizer=optimizer,
                                      total_steps=cfg.EPOCHS,
@@ -513,7 +470,28 @@ def train():
     L_max = len_list[0]
     E_orig = original_edge_index.shape[1]
 
+    # --- 核心修改：为 Ensemble Batch 预生成 Edge Index ---
+    # 实际 Batch Size 变为 B * K
+    effective_batch_size = cfg.BATCH_SIZE * cfg.ENSEMBLE_K
+    
     (full_edge_index, full_edge_weights) = batch_time_edge_index(
+        original_edge_index, 
+        original_edge_weights, 
+        cfg.NUM_NODES, 
+        effective_batch_size, # 这里使用扩展后的 batch size
+        L_max, 
+        device_id
+    )
+    edge_data = []
+    for L_d in len_list:
+        num_edges_needed = E_orig * effective_batch_size * L_d
+        slice_idx = full_edge_index[:, :num_edges_needed]
+        slice_w = full_edge_weights[:num_edges_needed]
+        edge_data.append((slice_idx, slice_w))
+
+    # --- 验证时使用标准的 Batch Size (不需要 K 倍) ---
+    # 所以需要准备一套原始大小的 edge_data 给 validation loop
+    (val_full_edge_index, val_full_edge_weights) = batch_time_edge_index(
         original_edge_index, 
         original_edge_weights, 
         cfg.NUM_NODES, 
@@ -521,14 +499,13 @@ def train():
         L_max, 
         device_id
     )
-    edge_data = []
+    val_edge_data = []
     for L_d in len_list:
         num_edges_needed = E_orig * cfg.BATCH_SIZE * L_d
+        slice_idx = val_full_edge_index[:, :num_edges_needed]
+        slice_w = val_full_edge_weights[:num_edges_needed]
+        val_edge_data.append((slice_idx, slice_w))
 
-        # 这些是视图(views)，不是拷贝(copies)，几乎不占内存
-        slice_idx = full_edge_index[:, :num_edges_needed]
-        slice_w = full_edge_weights[:num_edges_needed]
-        edge_data.append((slice_idx, slice_w))
 
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
@@ -545,31 +522,81 @@ def train():
             history_c, static_c, future_x0, future_known_c = tensors
             
             with amp.autocast():
-                b = future_x0.shape[0]
-                history_c_p = history_c.permute(0, 2, 1, 3)
-                future_x0_p = future_x0.permute(0, 2, 1, 3)
-                future_known_c_p = future_known_c.permute(0, 2, 1, 3)
-
-                noise = torch.randn_like(future_x0_p)
-                k = torch.randint(0, cfg.T, (b,), device=device_id).long()
+                # --- 1. 数据扩充 (Batch Expansion) ---
+                K = cfg.ENSEMBLE_K
+                batch_size_curr = future_x0.shape[0]
                 
-                sqrt_alpha_bar_k = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
-                sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
-                x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
+                # [B, ...] -> [B*K, ...]
+                history_c_exp = history_c.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                static_c_exp = static_c.repeat_interleave(K, dim=0)
+                future_x0_exp = future_x0.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                future_known_c_exp = future_known_c.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                
+                expanded_bs = batch_size_curr * K
+                
+                # --- 2. 噪声生成 ---
+                # 为每个扩充后的样本生成独立的噪声，这样对于同一个原始样本，模型会看到 K 个不同的噪声版本
+                noise = torch.randn_like(future_x0_exp)
+                
+                # 时间步采样: 对每个原始样本采样一个 t，然后重复 K 次
+                # 这样同一个样本的 K 个副本在同一个时间步 t 进行训练 (便于计算分布)
+                t = torch.randint(0, cfg.T, (batch_size_curr,), device=device_id).long()
+                t_exp = t.repeat_interleave(K, dim=0)
+                
+                # 加噪
+                sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(expanded_bs, 1, 1, 1)
+                sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(expanded_bs, 1, 1, 1)
+                x_t = sqrt_alpha_bar * future_x0_exp + sqrt_one_minus_alpha_bar * noise
 
-                predicted_noise, predicted_logvar = ddp_model(x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data)
-                # 为数值稳定，限制 logvar 范围
+                # --- 3. 模型前向传播 ---
+                # 注意：edge_data 已经是为扩展后的 Batch Size 准备的
+                # 处理最后一个不满的 batch 的 edge_data 切片
+                curr_edge_data = []
+                for (e_idx, e_w) in edge_data:
+                    num_edges = E_orig * expanded_bs * (e_idx.shape[1] // (E_orig * effective_batch_size))
+                    curr_edge_data.append((e_idx[:, :num_edges], e_w[:num_edges]))
+
+                predicted_noise, predicted_logvar = ddp_model(
+                    x_t, t_exp, history_c_exp, static_c_exp, future_known_c_exp, curr_edge_data, curr_edge_data
+                )
+                
+                # --- 4. 集成分布损失计算 (Ensemble Distribution Loss) ---
+                
+                # (A) 重构 x0 (Estimate x0 from predicted noise)
+                # formula: x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+                # 添加 eps 防止除零 (虽然 alpha_bar 通常 > 0)
+                pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                
+                # (B) 重塑维度以分组: [B*K, C, N, L] -> [B, K, C, N, L]
+                pred_x0_grouped = pred_x0_exp.view(batch_size_curr, K, cfg.TARGET_FEAT_DIM, cfg.NUM_NODES, cfg.PRED_LEN)
+                target_x0 = future_x0.permute(0, 3, 1, 2) # [B, C, N, L]
+                
+                # (C) 计算集成统计量
+                ensemble_mean = pred_x0_grouped.mean(dim=1) # [B, C, N, L]
+                ensemble_var = pred_x0_grouped.var(dim=1, unbiased=False) + 1e-6 # [B, C, N, L], 加上 epsilon 防止 log(0)
+                
+                # (D) 集成 NLL 损失 (Ensemble NLL Loss)
+                # 迫使 K 个预测的均值接近真值，且分布符合高斯
+                # Loss = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
+                ensemble_nll = 0.5 * torch.log(ensemble_var) + 0.5 * (target_x0 - ensemble_mean)**2 / ensemble_var
+                
+                # (E) 信噪比加权 (SNR Weighting)
+                # 由于在高噪声区域(t很大)，x0 的重构误差会非常大，我们需要降低其权重
+                # 使用 alpha_bar 作为权重 (类似于 SNR 权重)
+                weights = ddp_model.module.alphas_cumprod[t].view(batch_size_curr, 1, 1, 1)
+                weighted_ensemble_loss = (ensemble_nll * weights).mean()
+                
+                # (F) 辅助损失: LogVar Regularization
+                # 依然需要训练 LogVar 分支，以保证推理时 ddim_sample 正常工作
+                # 对每个样本单独计算标准的 NLL
                 min_logvar, max_logvar = -5.0, 3.0
-                pred_logvar = torch.clamp(predicted_logvar, min_logvar, max_logvar)
+                pred_logvar_clamped = torch.clamp(predicted_logvar, min_logvar, max_logvar)
+                aux_nll = 0.5 * torch.exp(-pred_logvar_clamped) * (noise - predicted_noise) ** 2 + 0.5 * pred_logvar_clamped
+                aux_loss = aux_nll.mean()
 
-                # NLL: 0.5 * exp(-logσ²) * (ε - εθ)² + 0.5 * logσ²
-                nll = 0.5 * torch.exp(-pred_logvar) * (noise - predicted_noise) ** 2 + 0.5 * pred_logvar
-
-                # 额外正则：阻止 logvar 继续疯狂往负方向走（让它更偏向 0 一点）
-                logvar_reg = 1e-3 * (pred_logvar ** 2)
-
-                # 对所有维度取平均，再做梯度累积缩放
-                loss = (nll + logvar_reg).mean() / cfg.ACCUMULATION_STEPS
+                # (G) 总损失
+                loss = cfg.ENSEMBLE_LAMBDA * weighted_ensemble_loss + cfg.LOGVAR_LAMBDA * aux_loss
+                loss = loss / cfg.ACCUMULATION_STEPS
 
             if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(train_dataloader):
                 scaler.scale(loss).backward()
@@ -586,6 +613,7 @@ def train():
         ddp_model.eval()
         total_val_loss = 0
         
+        # 验证集使用标准计算方式 (不进行 Ensemble 扩展，或者仅计算单次 NLL)
         with torch.no_grad():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
@@ -603,8 +631,14 @@ def train():
                     sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                     x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
+                    # 处理 val edge data
+                    curr_val_edge_data = []
+                    for (e_idx, e_w) in val_edge_data:
+                         num_edges = E_orig * b * (e_idx.shape[1] // (E_orig * cfg.BATCH_SIZE))
+                         curr_val_edge_data.append((e_idx[:, :num_edges], e_w[:num_edges]))
+
                     pred_noise, pred_logvar = ddp_model(
-                        x_k, k, history_c_p, static_c, future_known_c_p, edge_data, edge_data
+                        x_k, k, history_c_p, static_c, future_known_c_p, curr_val_edge_data, curr_val_edge_data
                     )
 
                     min_logvar, max_logvar = -5.0, 3.0
@@ -625,18 +659,17 @@ def train():
         dist.all_reduce(avg_val_loss_tensor, op=dist.ReduceOp.SUM)
         avg_val_loss = avg_val_loss_tensor.item() / world_size
 
-        # --- [新功能] 2. 准备日志数据 (仅 Rank 0) ---
+        # --- 日志数据准备 ---
         if rank == 0:
-            # 初始化本 epoch 的日志数据字典
             epoch_log_data = {
                 'epoch': epoch + 1,
                 'avg_train_loss': avg_train_loss,
                 'avg_val_loss': avg_val_loss,
                 'lr': optimizer.param_groups[0]['lr'],
-                'avg_val_mae': ''  # 默认为空字符串，如果 MAE 不运行，则记录为空
+                'avg_val_mae': '' 
             }
 
-        # --- 核心修改3: 更新保存最佳/次佳模型的逻辑 ---
+        # --- 模型保存逻辑 ---
         if rank == 0:
             print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
             if avg_val_loss < best_val_loss:
@@ -658,11 +691,12 @@ def train():
 
         run_mae_eval = cfg.EVAL_ON_VAL and (epoch + 1) % cfg.EVAL_ON_VAL_EPOCH == 0
         if run_mae_eval:
-            current_val_mae = float('inf') # 默认为无穷大
+            current_val_mae = float('inf') 
             
             print(f"Epoch {epoch+1}, running periodic MAE evaluation...")
+            # 注意：periodic_evaluate_mae 使用 val_edge_data (标准 batch size)
             current_val_seq_local = periodic_evaluate_mae(
-                ddp_model.module, # 传入原始模型
+                ddp_model.module, 
                 val_eval_loader,
                 train_y_scaler,
                 original_edge_index,
@@ -679,29 +713,22 @@ def train():
             )
             if rank == 0:
                 current_val_seq = np.concatenate(gathered_results, axis=0)
-                # 确保数据量正确 (因为 DistributedSampler 可能会填充数据)
                 current_val_seq = current_val_seq[:len(y_true_original)]
                 current_val_mae = np.mean(np.abs(current_val_seq - y_true_original))
 
-                # --- [新功能] 3. 更新日志字典中的 MAE ---
                 epoch_log_data['avg_val_mae'] = current_val_mae
 
-                # 打印日志
                 mae_log = f", Avg Val MAE: {current_val_mae:.4f}" if current_val_mae != float('inf') else ", Avg Val MAE: (skipped)"
                 print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}{mae_log}, LR: {optimizer.param_groups[0]['lr']:.2e}")            
             
-                # --- 核心修改4: 使用 MAE (如果已计算) 来保存模型 ---
-                # 只有当 current_val_mae 被计算过时 (不为 inf)，才执行保存逻辑
                 if current_val_mae < best_val_mae:
                     second_best_val_mae = best_val_mae
                     if best_model_path_for_eval is not None and os.path.exists(best_model_path_for_eval):
-                        # 检查旧的 "second_best" 路径是否存在，如果存在先删除
                         if os.path.exists(model_save_path_mae_second_best):
                             try:
                                 os.remove(model_save_path_mae_second_best)
                             except OSError as e:
                                 print(f"Warning: Could not remove old second_best model: {e}")
-                        # 将旧的 "best" 重命名为 "second_best"
                         os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
                         print(f"Model {os.path.basename(best_model_path_for_eval)} promoted to 2nd best (MAE).")
                         second_best_model_path_for_eval = model_save_path_mae_second_best
@@ -717,14 +744,12 @@ def train():
                     second_best_model_path_for_eval = model_save_path_mae_second_best
                     print(f"🥈 New 2nd best model saved to {model_save_path_mae_second_best} with validation MAE: {second_best_val_mae:.4f}")
 
-        # --- [新功能] 4. 在 epoch 末尾写入本轮日志 ---
         if rank == 0:
             csv_logger.log_epoch(epoch_log_data)
 
         dist.barrier()
         scheduler.step()
 
-    # --- 核心修改4: 采用V2.3的分布式评估流程 ---
     dist.barrier()
     if rank == 0:
         print("\n" + "="*50 + "\nTraining finished. Starting evaluation on the test set...\n" + "="*50 + "\n")
@@ -739,11 +764,9 @@ def train():
     metrics_best_val = None
     metrics_second_best_val = None
 
-    # 3. --- 所有卡并行评估 BEST VAL model ---
     if best_model_path_for_val_synced and os.path.exists(best_model_path_for_val_synced):
         if rank == 0:
             print(f"\n[ALL GPUS] Evaluating BEST VAL model (in parallel): {os.path.basename(best_model_path_for_val_synced)}")
-        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
         metrics_best_val = evaluate_model(
             cfg, best_model_path_for_val_synced, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path,
             device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best_val'
@@ -756,11 +779,9 @@ def train():
         if rank == 0:
             print("No best val model was saved. Skipping evaluation.")
             
-    # 4. --- 所有卡并行评估 2ND BEST VAL model ---
     if second_best_model_path_for_val_synced and os.path.exists(second_best_model_path_for_val_synced):
         if rank == 0:
              print(f"\n[ALL GPUS] Evaluating 2ND BEST VAL model (in parallel): {os.path.basename(second_best_model_path_for_val_synced)}")
-        # 所有进程再次调用 evaluate_model
         metrics_second_best_val = evaluate_model(
             cfg, second_best_model_path_for_val_synced, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path,
             device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best_val'
@@ -773,11 +794,9 @@ def train():
         if rank == 0:
             print(f"[ALL GPUS] No second best val model was saved. Skipping evaluation.")
 
-    # 1. --- 所有卡并行评估 BEST model ---
     if best_model_path_synced and os.path.exists(best_model_path_synced):
         if rank == 0:
             print(f"\n[ALL GPUS] Evaluating BEST model (in parallel): {os.path.basename(best_model_path_synced)}")
-        # 所有进程都调用 evaluate_model，函数内部会处理 DDP
         metrics_best = evaluate_model(
             cfg, best_model_path_synced, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path,
             device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='best'
@@ -790,11 +809,9 @@ def train():
         if rank == 0:
             print("No best model was saved. Skipping evaluation.")
             
-    # 2. --- 所有卡并行评估 2ND BEST model ---
     if second_best_model_path_synced and os.path.exists(second_best_model_path_synced):
         if rank == 0:
              print(f"\n[ALL GPUS] Evaluating 2ND BEST model (in parallel): {os.path.basename(second_best_model_path_synced)}")
-        # 所有进程再次调用 evaluate_model
         metrics_second_best = evaluate_model(
             cfg, second_best_model_path_synced, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path,
             device=f"cuda:{device_id}", rank=rank, world_size=world_size,key='second_best'
@@ -836,10 +853,6 @@ def train():
             print("\n===== [FINAL RESULT 4/4] 2ND BEST VAL Model: SKIPPED (not saved or error) =====")
 
     dist.destroy_process_group()
-
-# =============================================================================
-# ===================== 核心修改5: 全面替换为V2.3的评估逻辑 =====================
-# =============================================================================
 
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
@@ -944,20 +957,15 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     distances = adj_matrix[adj_matrix > 0]
     sigma = np.std(distances)
 
-    # 应用高斯核函数
     adj_matrix = np.exp(-np.square(adj_matrix) / (sigma**2))
     adj_matrix[adj_matrix < 0.1] = 0
     
     original_edge_index, original_edge_weights = get_edge_index(adj_matrix)
     test_dataset = EVChargerDatasetV2(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN, cfg, scaler_y=scaler_y, scaler_mm=scaler_mm, scaler_z=scaler_z)
     print(f"Test dataset size: {len(test_dataset)} samples.")
-    # --- 使用 DistributedSampler 切分测试集 ---
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
-    # original_test_samples = create_sliding_windows(test_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
-    # y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_test_samples]).squeeze(-1)
-
     all_predictions_list, all_samples_list, all_true_list, all_idx_list = [], [], [], []
 
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
@@ -992,12 +1000,6 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
             median_prediction = torch.median(stacked_samples, dim=0).values
 
             denorm_pred, denorm_samples = median_prediction.cpu().numpy(), stacked_samples.cpu().numpy()
-            # if scaler:
-            #     denorm_pred = scaler.inverse_transform(denorm_pred.reshape(-1, 1)).reshape(denorm_pred.shape)
-            #     denorm_samples = scaler.inverse_transform(denorm_samples.reshape(-1, 1)).reshape(denorm_samples.shape)
-            
-            # all_predictions_list.append(denorm_pred)
-            # all_samples_list.append(denorm_samples)
             all_predictions_list.append(median_prediction.cpu().numpy())
             all_samples_list.append(stacked_samples.cpu().numpy())
 
@@ -1007,8 +1009,6 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     print(f"Rank {rank} :idx list:{all_idx_list}")
 
     if not all_predictions_list:
-        # 如果某个 rank 没有数据 (例如数据集大小不能被 world_size 整除且 drop_last=False)
-        # 我们创建一个空的数组以避免 gather 失败
         local_predictions = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_samples = np.empty((cfg.NUM_SAMPLES, 0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_true = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
@@ -1030,7 +1030,6 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     dist.gather_object(local_idx, gathered_idx if rank == 0 else None, dst=0)
     
     if rank == 0:
-        # 拼接所有 GPU 的结果
         all_predictions_norm = np.concatenate(gathered_preds, axis=0)
         all_samples_norm = np.concatenate(gathered_samples, axis=1)
         all_true_norm = np.concatenate(gathered_true, axis=0)
@@ -1043,27 +1042,20 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
         all_true_norm = all_true_norm[order]
         all_samples_norm = all_samples_norm[:, order]
 
-        # 1. 在 rank 0 上进行反归一化
         if scaler_y:
-            # (B, N, L, 1) -> (B*N*L, 1) -> (B*N*L, 1) -> (B, N, L, 1)
             all_predictions = scaler_y.inverse_transform(all_predictions_norm.reshape(-1, 1)).reshape(all_predictions_norm.shape)
             y_true_original = scaler_y.inverse_transform(all_true_norm.reshape(-1, 1)).reshape(all_true_norm.shape)
-            # (S, B, N, L, 1) -> (S*B*N*L, 1) -> (S*B*N*L, 1) -> (S, B, N, L, 1)
             all_samples = scaler_y.inverse_transform(all_samples_norm.reshape(-1, 1)).reshape(all_samples_norm.shape)
         else:
             all_predictions = all_predictions_norm
             y_true_original = all_true_norm
             all_samples = all_samples_norm
 
-        # 截断，使分布在合法区间内
         all_predictions = np.clip(all_predictions, 0.0, 1.0)
         all_samples = np.clip(all_samples, 0.0, 1.0)
 
-        # 2. 调整维度以匹配 calculate_metrics 函数的期望
-        # (B, N, L, 1) -> (B, N, L) -> (B, L, N)
         all_predictions = all_predictions.squeeze(-1).transpose(0, 2, 1)
         y_true_original = y_true_original.squeeze(-1).transpose(0, 2, 1)
-        # (S, B, N, L, 1) -> (S, B, N, L) -> (B, S, L, N)
         all_samples = all_samples.squeeze(-1).transpose(1, 0, 3, 2)
 
         print(f"y_true shape:{y_true_original.shape}")
@@ -1075,9 +1067,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
         try:
-            # 注意：这个基线文件路径是硬编码的
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
-            # 基线模型 shape 适配
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
             all_baseline_preds = all_baseline_preds[:all_predictions.shape[0]]
             y_true_original = y_true_original[:all_baseline_preds.shape[0]]
