@@ -568,8 +568,13 @@ def train():
                 pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
                 
                 # (B) 重塑维度以分组: [B*K, C, N, L] -> [B, K, C, N, L]
-                pred_x0_grouped = pred_x0_exp.view(batch_size_curr, K, cfg.TARGET_FEAT_DIM, cfg.NUM_NODES, cfg.PRED_LEN)
-                target_x0 = future_x0.permute(0, 3, 1, 2) # [B, C, N, L]
+                # 先 view 拆分 B 和 K，保持内存布局 (B, K, N, L, C)
+                pred_x0_grouped = pred_x0_exp.view(batch_size_curr, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                # 再 permute 调整维度顺序到 (B, K, C, N, L)
+                pred_x0_grouped = pred_x0_grouped.permute(0, 1, 4, 2, 3)
+                # future_x0 是 (B, L, N, C)，我们需要 (B, C, N, L)
+                # 对应索引: 0->0, 3->1, 2->2, 1->3
+                target_x0 = future_x0.permute(0, 3, 2, 1)
                 
                 # (C) 计算集成统计量
                 ensemble_mean = pred_x0_grouped.mean(dim=1) # [B, C, N, L]
