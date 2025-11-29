@@ -362,7 +362,7 @@ class UGnetV2(nn.Module):
 
 class SpatioTemporalDiffusionModelV2(nn.Module):
     """完整的V2.5版时空扩散模型。"""
-    def __init__(self, in_features, out_features, history_features, static_features, poi_features, future_known_features, model_dim, num_heads, T=1000,depth=2):
+    def __init__(self, in_features, out_features, history_features, static_features, future_known_features, model_dim, num_heads, T=1000,depth=2):
         super().__init__()
         self.T = T
         self.out_features = out_features
