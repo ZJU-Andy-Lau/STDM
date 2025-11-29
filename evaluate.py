@@ -381,8 +381,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
                     history_edge_data=edge_data,
                     poi = poi,
                     future_edge_data=edge_data,
-                    shape=future_x0_true.permute(0, 2, 1, 3).shape, sampling_steps=cfg.SAMPLING_STEPS,
-                    eta=cfg.SAMPLING_ETA
+                    shape=future_x0_true.permute(0, 2, 1, 3).shape
                 )
                 generated_samples.append(sample)
             
