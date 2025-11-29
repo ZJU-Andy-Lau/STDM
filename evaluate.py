@@ -94,8 +94,8 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 20
-    SAMPLING_STEPS = 50
+    NUM_SAMPLES = 10
+    SAMPLING_STEPS = 10
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 辅助函数：图处理 ---
