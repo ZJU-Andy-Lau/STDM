@@ -133,7 +133,7 @@ class ConfigV2:
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 4 # 注意：这是【单张卡】的batch size。实际输入到模型的 batch 会变为 BATCH_SIZE * ENSEMBLE_K
+    BATCH_SIZE = 2 # 注意：这是【单张卡】的batch size。实际输入到模型的 batch 会变为 BATCH_SIZE * ENSEMBLE_K
     LEARNING_RATE = 1e-4
     ACCUMULATION_STEPS = 4
 
