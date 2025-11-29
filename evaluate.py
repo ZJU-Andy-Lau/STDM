@@ -363,6 +363,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
             history_c, static_c, poi, future_x0_true, future_known_c, idx = tensors
             history_c = history_c.to(cfg.DEVICE)
             static_c = static_c.to(cfg.DEVICE)
+            poi = poi.to(cfg.DEVICE)
             future_x0_true = future_x0_true.to(cfg.DEVICE)
             future_known_c = future_known_c.to(cfg.DEVICE)
 
