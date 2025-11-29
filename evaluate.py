@@ -316,7 +316,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
-        history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES,
+        history_features=cfg.HISTORY_FEATURES+cfg.POI_FEATURES, static_features=cfg.STATIC_FEATURES-cfg.POI_FEATURES,
         future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM, model_dim=cfg.MODEL_DIM,
         num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH
     ).to(cfg.DEVICE)
