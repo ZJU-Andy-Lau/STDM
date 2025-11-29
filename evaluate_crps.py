@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 # --- 导入模型 ---
 # 确保 model_v2_gcngat.py 在同一个目录下
 try:
-    from model_sigma import SpatioTemporalDiffusionModelV2
+    from model_crps import SpatioTemporalDiffusionModelV2
 except ImportError:
     print("错误：无法导入 'model_v2_gcngat.py'。")
     print("请确保 'model_v2_gcngat.py' 文件与此脚本在同一目录中。")
@@ -56,6 +56,7 @@ class ConfigV2:
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
+    POI_FEATURES = 3
     
     # 模型参数
     MODEL_DIM = 64
@@ -199,7 +200,13 @@ class EVChargerDatasetV2(Dataset):
         future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
-        return history_c, self.static_features, future_x0, future_known_c, idx
+
+        static = torch.cat((self.static_features[:, 0:2], self.static_features[:, 5:]), dim=-1)
+        poi = self.static_features[:, 2:5]
+        return history_c, static, poi, future_x0, future_known_c, idx
+
+        
+        # return history_c, self.static_features, future_x0, future_known_c, idx
 
 
     def get_scaler(self):
@@ -316,7 +323,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
-        history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES,
+        history_features=cfg.HISTORY_FEATURES+cfg.POI_FEATURES, static_features=cfg.STATIC_FEATURES-cfg.POI_FEATURES,
         future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM, model_dim=cfg.MODEL_DIM,
         num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH
     ).to(cfg.DEVICE)
@@ -353,9 +360,10 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
-            history_c, static_c, future_x0_true, future_known_c, idx = tensors
+            history_c, static_c, poi, future_x0_true, future_known_c, idx = tensors
             history_c = history_c.to(cfg.DEVICE)
             static_c = static_c.to(cfg.DEVICE)
+            poi = poi.to(cfg.DEVICE)
             future_x0_true = future_x0_true.to(cfg.DEVICE)
             future_known_c = future_known_c.to(cfg.DEVICE)
 
@@ -368,13 +376,13 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
 
             generated_samples = []
             for _ in range(cfg.NUM_SAMPLES):
-                sample = model.ddim_sample(
+                sample = model.ddpm_sample(
                     history_c=history_c.permute(0, 2, 1, 3), static_c=static_c,
                     future_known_c=future_known_c.permute(0, 2, 1, 3),
                     history_edge_data=edge_data,
+                    poi = poi,
                     future_edge_data=edge_data,
-                    shape=future_x0_true.permute(0, 2, 1, 3).shape, sampling_steps=cfg.SAMPLING_STEPS,
-                    eta=cfg.SAMPLING_ETA
+                    shape=future_x0_true.permute(0, 2, 1, 3).shape
                 )
                 generated_samples.append(sample)
             

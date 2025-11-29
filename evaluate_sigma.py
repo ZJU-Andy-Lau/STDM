@@ -455,8 +455,8 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
         print(f"all_samples shape:{all_samples.shape}")
 
         np.save(f'./results/truths.npy', y_true_original)
-        np.save(f'./results/pred_{cfg.RUN_ID}_{key}_1.0.npy', all_predictions)
-        np.save(f'./results/samples_{cfg.RUN_ID}_{key}_1.0.npy', all_samples)
+        np.save(f'./results/pred_{cfg.RUN_ID}_{key}_sigma.npy', all_predictions)
+        np.save(f'./results/samples_{cfg.RUN_ID}_{key}_sigma.npy', all_samples)
 
         try:
             # 注意：这个基线文件路径是硬编码的
