@@ -56,6 +56,7 @@ class ConfigV2:
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM
+    POI_FEATURES = 3
     
     # 模型参数
     MODEL_DIM = 64
@@ -206,7 +207,6 @@ class EVChargerDatasetV2(Dataset):
 
         
         # return history_c, self.static_features, future_x0, future_known_c, idx
-        return history_c, self.static_features, future_x0, future_known_c, idx
 
 
     def get_scaler(self):
