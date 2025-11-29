@@ -199,6 +199,13 @@ class EVChargerDatasetV2(Dataset):
         future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
+
+        static = torch.cat((self.static_features[:, 0:2], self.static_features[:, 5:]), dim=-1)
+        poi = self.static_features[:, 2:5]
+        return history_c, static, poi, future_x0, future_known_c, idx
+
+        
+        # return history_c, self.static_features, future_x0, future_known_c, idx
         return history_c, self.static_features, future_x0, future_known_c, idx
 
 
