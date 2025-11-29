@@ -94,8 +94,8 @@ class ConfigV2:
 # --- 评估专用配置 ---
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
-    NUM_SAMPLES = 10
-    SAMPLING_STEPS = 10
+    NUM_SAMPLES = 20
+    SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 辅助函数：图处理 ---
@@ -360,7 +360,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
-            history_c, static_c, future_x0_true, future_known_c, idx = tensors
+            history_c, static_c, poi, future_x0_true, future_known_c, idx = tensors
             history_c = history_c.to(cfg.DEVICE)
             static_c = static_c.to(cfg.DEVICE)
             future_x0_true = future_x0_true.to(cfg.DEVICE)
@@ -379,6 +379,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
                     history_c=history_c.permute(0, 2, 1, 3), static_c=static_c,
                     future_known_c=future_known_c.permute(0, 2, 1, 3),
                     history_edge_data=edge_data,
+                    poi = poi,
                     future_edge_data=edge_data,
                     shape=future_x0_true.permute(0, 2, 1, 3).shape, sampling_steps=cfg.SAMPLING_STEPS,
                     eta=cfg.SAMPLING_ETA
