@@ -24,10 +24,10 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 try:
-    from train_sigma.config import EvalConfig
-    from train_sigma.utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
-    from train_sigma.dataset import EVChargerDatasetV2
-    from train_sigma.metrics import calculate_metrics, dm_test, print_metrics
+    from train_avg.config import EvalConfig
+    from train_avg.utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
+    from train_avg.dataset import EVChargerDatasetV2
+    from train_avg.metrics import calculate_metrics, dm_test, print_metrics
 except ImportError:
     from config import EvalConfig
     from utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
