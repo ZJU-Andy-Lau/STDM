@@ -15,7 +15,7 @@ def calculate_metrics(y_true, y_pred_median, y_pred_samples, device):
     metrics['crps'] = float(ps.crps_ensemble(y_true, y_pred_samples.transpose(1, 0, 2, 3), axis=0).mean())
 
     horizon_metrics = []
-    for i in range(y_true.shape[1]): # 遍历预测长度
+    for i in range(y_true.shape[1]):
         y_true_h, y_pred_median_h, y_pred_samples_h = y_true[:, i, :], y_pred_median[:, i, :], y_pred_samples[:, :, i, :]
         mae_h = float(np.mean(np.abs(y_pred_median_h - y_true_h)))
         rmse_h = float(np.sqrt(np.mean((y_pred_median_h - y_true_h)**2)))

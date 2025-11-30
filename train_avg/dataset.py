@@ -19,7 +19,6 @@ class EVChargerDatasetV2(Dataset):
         minmax_features = features[:, :, cfg.HISTORY_FEATURES-4:cfg.HISTORY_FEATURES+5].copy()
         zscore_features = features[:, :, cfg.HISTORY_FEATURES+5:].copy()
         
-
         dynamic_features = features[:, :, :cfg.HISTORY_FEATURES].copy()
         static_features = features[0, :, cfg.HISTORY_FEATURES:].copy()
 
@@ -52,7 +51,6 @@ class EVChargerDatasetV2(Dataset):
         z_norm = self.scaler_z.transform(
             zscore_features.reshape(-1, zscore_features.shape[-1])
         ).reshape(zscore_features.shape)
-
 
         dynamic_features[:, :, cfg.HISTORY_FEATURES-4:] = mm_norm[:, :, :4]
 
@@ -90,7 +88,6 @@ class EVChargerDatasetV2(Dataset):
         known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
         future_known_c = torch.tensor(future[:, :, known_start_idx : self.cfg.HISTORY_FEATURES], dtype=torch.float)
         return history_c, self.static_features, future_x0, future_known_c, idx
-
 
     def get_scaler(self):
         return self.scaler_y, self.scaler_mm, self.scaler_z
