@@ -133,7 +133,7 @@ class ConfigV2:
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 1 # 注意：这是【单张卡】的batch size。实际输入到模型的 batch 会变为 BATCH_SIZE * ENSEMBLE_K
+    BATCH_SIZE = 4 # 这里保持为 4，通过 Micro-batch 技术，显存仅需支持 1*K
     LEARNING_RATE = 1e-4
     ACCUMULATION_STEPS = 4
 
@@ -470,27 +470,27 @@ def train():
     L_max = len_list[0]
     E_orig = original_edge_index.shape[1]
 
-    # --- 核心修改：为 Ensemble Batch 预生成 Edge Index ---
-    # 实际 Batch Size 变为 B * K
-    effective_batch_size = cfg.BATCH_SIZE * cfg.ENSEMBLE_K
+    # --- 核心修改1：为 Micro-Batch 预生成 Edge Index (Size = K) ---
+    # 在微批次训练中，每次只处理 1 个样本，扩展 K 倍。因此显存中的有效 Batch Size 是 K。
+    micro_batch_size_eff = cfg.ENSEMBLE_K
     
-    (full_edge_index, full_edge_weights) = batch_time_edge_index(
+    (micro_full_edge_index, micro_full_edge_weights) = batch_time_edge_index(
         original_edge_index, 
         original_edge_weights, 
         cfg.NUM_NODES, 
-        effective_batch_size, # 这里使用扩展后的 batch size
+        micro_batch_size_eff, # Size = K
         L_max, 
         device_id
     )
-    edge_data = []
+    micro_edge_data = []
     for L_d in len_list:
-        num_edges_needed = E_orig * effective_batch_size * L_d
-        slice_idx = full_edge_index[:, :num_edges_needed]
-        slice_w = full_edge_weights[:num_edges_needed]
-        edge_data.append((slice_idx, slice_w))
+        num_edges_needed = E_orig * micro_batch_size_eff * L_d
+        slice_idx = micro_full_edge_index[:, :num_edges_needed]
+        slice_w = micro_full_edge_weights[:num_edges_needed]
+        micro_edge_data.append((slice_idx, slice_w))
 
-    # --- 验证时使用标准的 Batch Size (不需要 K 倍) ---
-    # 所以需要准备一套原始大小的 edge_data 给 validation loop
+    # --- 核心修改2：为 Validation 准备标准 Edge Index (Size = BATCH_SIZE) ---
+    # 验证集不需要 Ensemble 扩展，使用标准配置
     (val_full_edge_index, val_full_edge_weights) = batch_time_edge_index(
         original_edge_index, 
         original_edge_weights, 
@@ -515,110 +515,138 @@ def train():
         ddp_model.train()
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS} [Train]", disable=(rank != 0))
         total_train_loss = 0.0
+        
+        # 确保每个 Batch 开始前梯度清零
         optimizer.zero_grad()
 
         for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
-            tensors = [d.to(device_id) for d in (history_c, static_c, future_x0, future_known_c)]
-            history_c, static_c, future_x0, future_known_c = tensors
+            # 获取当前 Batch 的真实大小 (处理 drop_last=False 或 drop_last=True 的情况)
+            current_batch_size = future_x0.shape[0]
             
-            with amp.autocast():
-                # --- 1. 数据扩充 (Batch Expansion) ---
-                K = cfg.ENSEMBLE_K
-                batch_size_curr = future_x0.shape[0]
-                
-                # [B, ...] -> [B*K, ...]
-                history_c_exp = history_c.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                static_c_exp = static_c.repeat_interleave(K, dim=0)
-                future_x0_exp = future_x0.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                future_known_c_exp = future_known_c.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                
-                expanded_bs = batch_size_curr * K
-                
-                # --- 2. 噪声生成 ---
-                # 为每个扩充后的样本生成独立的噪声，这样对于同一个原始样本，模型会看到 K 个不同的噪声版本
-                noise = torch.randn_like(future_x0_exp)
-                
-                # 时间步采样: 对每个原始样本采样一个 t，然后重复 K 次
-                # 这样同一个样本的 K 个副本在同一个时间步 t 进行训练 (便于计算分布)
-                t = torch.randint(0, cfg.T, (batch_size_curr,), device=device_id).long()
-                t_exp = t.repeat_interleave(K, dim=0)
-                
-                # 加噪
-                sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(expanded_bs, 1, 1, 1)
-                sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(expanded_bs, 1, 1, 1)
-                x_t = sqrt_alpha_bar * future_x0_exp + sqrt_one_minus_alpha_bar * noise
+            # 判断是否是 Gradient Accumulation Cycle 的最后一步
+            is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+            
+            # 记录当前 Batch 的累积 Loss (仅用于打印)
+            batch_loss_tracker = 0.0
 
-                # --- 3. 模型前向传播 ---
-                # 注意：edge_data 已经是为扩展后的 Batch Size 准备的
-                # 处理最后一个不满的 batch 的 edge_data 切片
-                curr_edge_data = []
-                for (e_idx, e_w) in edge_data:
-                    num_edges = E_orig * expanded_bs * (e_idx.shape[1] // (E_orig * effective_batch_size))
-                    curr_edge_data.append((e_idx[:, :num_edges], e_w[:num_edges]))
+            # --- [核心修改3] 内部循环：微批次 (Micro-batch) 处理 ---
+            # 逐个样本处理，显存占用降低为 1/B
+            for micro_idx in range(current_batch_size):
+                
+                # --- DDP 上下文控制 (通信优化) ---
+                # 策略：只有在 "即将进行 Optimizer Step" 的 "最后一个微批次" 才允许同步
+                # 否则全部在本地累积梯度
+                is_last_micro = (micro_idx == current_batch_size - 1)
+                
+                if is_grad_update_step and is_last_micro:
+                    context = nullcontext() # 允许 Sync
+                else:
+                    context = ddp_model.no_sync() # 禁止 Sync
+                
+                with context:
+                    with amp.autocast():
+                        # A. 切片并移动到 GPU (保持维度 [1, ...])
+                        hist_micro = history_c[micro_idx:micro_idx+1].to(device_id)
+                        stat_micro = static_c[micro_idx:micro_idx+1].to(device_id)
+                        future_micro = future_x0[micro_idx:micro_idx+1].to(device_id)
+                        known_micro = future_known_c[micro_idx:micro_idx+1].to(device_id)
+                        
+                        # B. 数据扩充 (Expansion)
+                        # [1, ...] -> [K, ...]
+                        K = cfg.ENSEMBLE_K
+                        # 对于 permute 过的维度，注意 repeat_interleave 的位置
+                        # 这里先在 CPU 切片 (DataLoader 输出) 是 (B, 12, 275, F)
+                        # repeat_interleave 后变为 (K, 12, 275, F)，再 permute 到 model 需要的 (K, 275, 12, F)
+                        hist_exp = hist_micro.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        stat_exp = stat_micro.repeat_interleave(K, dim=0)
+                        future_exp = future_micro.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        known_exp = known_micro.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        
+                        # C. 噪声生成 (为 K 个副本生成不同噪声)
+                        noise = torch.randn_like(future_exp)
+                        
+                        # D. 时间步采样 (所有 K 个副本共享同一个 t)
+                        t_scalar = torch.randint(0, cfg.T, (1,), device=device_id).long()
+                        t_exp = t_scalar.repeat(K)
+                        
+                        # E. 加噪
+                        sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(K, 1, 1, 1)
+                        sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(K, 1, 1, 1)
+                        x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
 
-                predicted_noise, predicted_logvar = ddp_model(
-                    x_t, t_exp, history_c_exp, static_c_exp, future_known_c_exp, curr_edge_data, curr_edge_data
-                )
-                
-                # --- 4. 集成分布损失计算 (Ensemble Distribution Loss) ---
-                
-                # (A) 重构 x0 (Estimate x0 from predicted noise)
-                # formula: x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
-                # 添加 eps 防止除零 (虽然 alpha_bar 通常 > 0)
-                pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
-                
-                # (B) 重塑维度以分组: [B*K, C, N, L] -> [B, K, C, N, L]
-                # 先 view 拆分 B 和 K，保持内存布局 (B, K, N, L, C)
-                pred_x0_grouped = pred_x0_exp.view(batch_size_curr, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                # 再 permute 调整维度顺序到 (B, K, C, N, L)
-                pred_x0_grouped = pred_x0_grouped.permute(0, 1, 4, 2, 3)
-                # future_x0 是 (B, L, N, C)，我们需要 (B, C, N, L)
-                # 对应索引: 0->0, 3->1, 2->2, 1->3
-                target_x0 = future_x0.permute(0, 3, 2, 1)
-                
-                # (C) 计算集成统计量
-                ensemble_mean = pred_x0_grouped.mean(dim=1) # [B, C, N, L]
-                ensemble_var = pred_x0_grouped.var(dim=1, unbiased=False) + 1e-6 # [B, C, N, L], 加上 epsilon 防止 log(0)
-                
-                # (D) 集成 NLL 损失 (Ensemble NLL Loss)
-                # 迫使 K 个预测的均值接近真值，且分布符合高斯
-                # Loss = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
-                ensemble_nll = 0.5 * torch.log(ensemble_var) + 0.5 * (target_x0 - ensemble_mean)**2 / ensemble_var
-                
-                # (E) 信噪比加权 (SNR Weighting)
-                # 由于在高噪声区域(t很大)，x0 的重构误差会非常大，我们需要降低其权重
-                # 使用 alpha_bar 作为权重 (类似于 SNR 权重)
-                weights = ddp_model.module.alphas_cumprod[t].view(batch_size_curr, 1, 1, 1)
-                weighted_ensemble_loss = (ensemble_nll * weights).mean()
-                
-                # (F) 辅助损失: LogVar Regularization
-                # 依然需要训练 LogVar 分支，以保证推理时 ddim_sample 正常工作
-                # 对每个样本单独计算标准的 NLL
-                min_logvar, max_logvar = -5.0, 3.0
-                pred_logvar_clamped = torch.clamp(predicted_logvar, min_logvar, max_logvar)
-                aux_nll = 0.5 * torch.exp(-pred_logvar_clamped) * (noise - predicted_noise) ** 2 + 0.5 * pred_logvar_clamped
-                aux_loss = aux_nll.mean()
+                        # F. 前向传播 (使用预生成的 micro_edge_data)
+                        predicted_noise, predicted_logvar = ddp_model(
+                            x_t, t_exp, hist_exp, stat_exp, known_exp, micro_edge_data, micro_edge_data
+                        )
+                        
+                        # --- G. 集成分布损失计算 (Ensemble Distribution Loss) ---
+                        
+                        # (1) 重构 x0
+                        pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                        
+                        # (2) 维度修正 [核心修复]
+                        # pred_x0_exp: (K, 275, 12, 1)
+                        # 需要 reshape 成 (1, K, 275, 12, 1) 然后 permute 成 (1, K, 1, 275, 12)
+                        # 因为 micro_batch_size = 1
+                        pred_x0_grouped = pred_x0_exp.view(1, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                        pred_x0_grouped = pred_x0_grouped.permute(0, 1, 4, 2, 3) # [1, K, C, N, L]
+                        
+                        # target_x0: future_micro 是 (1, 12, 275, 1)
+                        # 需要 permute 成 (1, 1, 275, 12) -> (B, C, N, L)
+                        target_x0 = future_micro.permute(0, 3, 2, 1)
+                        
+                        # (3) 计算统计量
+                        ensemble_mean = pred_x0_grouped.mean(dim=1) # [1, C, N, L]
+                        ensemble_var = pred_x0_grouped.var(dim=1, unbiased=False) + 1e-6 # [1, C, N, L]
+                        
+                        # (4) NLL Loss
+                        ensemble_nll = 0.5 * torch.log(ensemble_var) + 0.5 * (target_x0 - ensemble_mean)**2 / ensemble_var
+                        
+                        # (5) SNR Weighting
+                        weights = ddp_model.module.alphas_cumprod[t_scalar].view(1, 1, 1, 1)
+                        weighted_ensemble_loss = (ensemble_nll * weights).mean()
+                        
+                        # (6) Aux Loss (LogVar)
+                        min_logvar, max_logvar = -5.0, 3.0
+                        pred_logvar_clamped = torch.clamp(predicted_logvar, min_logvar, max_logvar)
+                        aux_nll = 0.5 * torch.exp(-pred_logvar_clamped) * (noise - predicted_noise) ** 2 + 0.5 * pred_logvar_clamped
+                        aux_loss = aux_nll.mean()
 
-                # (G) 总损失
-                loss = cfg.ENSEMBLE_LAMBDA * weighted_ensemble_loss + cfg.LOGVAR_LAMBDA * aux_loss
-                loss = loss / cfg.ACCUMULATION_STEPS
+                        # (7) 总损失
+                        loss = cfg.ENSEMBLE_LAMBDA * weighted_ensemble_loss + cfg.LOGVAR_LAMBDA * aux_loss
+                        
+                        # --- H. Loss 缩放 (关键) ---
+                        # 为了保持梯度等效于 "Batch=4, Acc=4"，我们需要除以总份数
+                        # 总份数 = current_batch_size * accumulation_steps
+                        loss = loss / (current_batch_size * cfg.ACCUMULATION_STEPS)
 
-            if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(train_dataloader):
-                scaler.scale(loss).backward()
+                    # I. Backward (本地累积)
+                    scaler.scale(loss).backward()
+                    
+                    # 记录未缩放的 Loss 用于打印
+                    batch_loss_tracker += loss.item() * (current_batch_size * cfg.ACCUMULATION_STEPS)
+
+            # --- 外部循环：参数更新 ---
+            if is_grad_update_step:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                
+                # 只有在 Update 步才记录 Loss 到进度条 (显示的是这几个 Batch 的平均)
+                # 这里 batch_loss_tracker 是当前 Batch 的总和
+                # 为了显示平滑，我们简单地取当前 Batch 的平均值
+                avg_loss_step = batch_loss_tracker / current_batch_size
+                total_train_loss += avg_loss_step # 这里简单累加用于 Epoch 平均
+                if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
             else:
-                with ddp_model.no_sync():
-                    scaler.scale(loss).backward()
+                # 非 Update 步也累加 Loss
+                avg_loss_step = batch_loss_tracker / current_batch_size
+                total_train_loss += avg_loss_step
 
-            total_train_loss += loss.item() * cfg.ACCUMULATION_STEPS
-            if rank == 0: progress_bar.set_postfix(loss=loss.item())
-
+        # --- 验证循环 (保持标准 Batch 逻辑) ---
         ddp_model.eval()
         total_val_loss = 0
         
-        # 验证集使用标准计算方式 (不进行 Ensemble 扩展，或者仅计算单次 NLL)
         with torch.no_grad():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
@@ -636,7 +664,7 @@ def train():
                     sqrt_one_minus_alpha_bar_k = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                     x_k = sqrt_alpha_bar_k * future_x0_p + sqrt_one_minus_alpha_bar_k * noise
 
-                    # 处理 val edge data
+                    # 处理 val edge data (处理最后一个可能不满的 batch)
                     curr_val_edge_data = []
                     for (e_idx, e_w) in val_edge_data:
                          num_edges = E_orig * b * (e_idx.shape[1] // (E_orig * cfg.BATCH_SIZE))
