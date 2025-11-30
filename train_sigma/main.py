@@ -1,3 +1,22 @@
+import sys
+import os
+
+# --- 路径黑魔法：确保可以直接运行 python train_sigma/main.py ---
+# 获取当前脚本的绝对路径 (e.g., /path/to/project/train_sigma/main.py)
+current_file_path = os.path.abspath(__file__)
+# 获取当前脚本所在的目录 (e.g., /path/to/project/train_sigma)
+current_dir = os.path.dirname(current_file_path)
+# 获取项目根目录 (e.g., /path/to/project)
+project_root = os.path.dirname(current_dir)
+
+# 将项目根目录添加到 sys.path，以便能找到 model_sigma.py 和 scheduler.py
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# 同时也确保 train_sigma 包本身可以被解析 (虽然有了根目录通常就够了，但为了保险)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
 import warnings
 warnings.filterwarnings("ignore")
 import torch
@@ -6,7 +25,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 from tqdm import tqdm
-import os
 from datetime import datetime
 from torch.cuda import amp
 from contextlib import nullcontext
@@ -17,14 +35,23 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# 导入本地包
-from .config import ConfigV2
-from .utils import CsvLogger, get_edge_index, calc_layer_lengths, batch_time_edge_index, create_sliding_windows
-from .dataset import EVChargerDatasetV2
-from .metrics import print_metrics
-from .evaluation import periodic_evaluate_mae, evaluate_model
+# 导入本地包 (改为绝对导入，或者直接导入)
+# 由于我们将 project_root 加入了 sys.path，我们可以用 train_sigma.config
+try:
+    from train_sigma.config import ConfigV2
+    from train_sigma.utils import CsvLogger, get_edge_index, calc_layer_lengths, batch_time_edge_index, create_sliding_windows
+    from train_sigma.dataset import EVChargerDatasetV2
+    from train_sigma.metrics import print_metrics
+    from train_sigma.evaluation import periodic_evaluate_mae, evaluate_model
+except ImportError:
+    # 如果 train_sigma 不在 path 中被识别为包，尝试直接导入 (fallback)
+    from config import ConfigV2
+    from utils import CsvLogger, get_edge_index, calc_layer_lengths, batch_time_edge_index, create_sliding_windows
+    from dataset import EVChargerDatasetV2
+    from metrics import print_metrics
+    from evaluation import periodic_evaluate_mae, evaluate_model
 
-# 导入根目录模型和调度器 (运行方式 python -m train_sigma.main)
+# 导入根目录模型和调度器
 from model_sigma import SpatioTemporalDiffusionModelV2
 from scheduler import MultiStageOneCycleLR
 
@@ -395,7 +422,7 @@ def train():
                                 print(f"Warning: Could not remove old second_best model: {e}")
                         os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
                         print(f"Model {os.path.basename(best_model_path_for_eval)} promoted to 2nd best (MAE).")
-                        second_best_model_path_for_eval = model_save_path_mae_second_best
+                        second_best_model_path_for_val = model_save_path_mae_second_best
 
                     best_val_mae = current_val_mae
                     torch.save(ddp_model.module.state_dict(), model_save_path_mae_best)

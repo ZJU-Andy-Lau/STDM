@@ -2,15 +2,37 @@ import torch
 import numpy as np
 import os
 import joblib
+import sys
 from tqdm import tqdm
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda import amp
 import torch.distributed as dist
 
-from .config import EvalConfig
-from .utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
-from .dataset import EVChargerDatasetV2
-from .metrics import calculate_metrics, dm_test, print_metrics
+# 获取当前脚本的绝对路径 (e.g., /path/to/project/train_sigma/evaluation.py)
+current_file_path = os.path.abspath(__file__)
+# 获取当前脚本所在的目录 (e.g., /path/to/project/train_sigma)
+current_dir = os.path.dirname(current_file_path)
+# 获取项目根目录 (e.g., /path/to/project)
+project_root = os.path.dirname(current_dir)
+
+# 将项目根目录添加到 sys.path
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# 确保 train_sigma 包本身可以被解析
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+try:
+    from train_sigma.config import EvalConfig
+    from train_sigma.utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
+    from train_sigma.dataset import EVChargerDatasetV2
+    from train_sigma.metrics import calculate_metrics, dm_test, print_metrics
+except ImportError:
+    from config import EvalConfig
+    from utils import calc_layer_lengths, batch_time_edge_index, get_edge_index
+    from dataset import EVChargerDatasetV2
+    from metrics import calculate_metrics, dm_test, print_metrics
 
 # 这里注意 model_sigma 需要从上级目录导入，运行 main.py 时路径会自动处理
 from model_sigma import SpatioTemporalDiffusionModelV2
