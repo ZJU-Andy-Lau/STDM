@@ -4,7 +4,7 @@ import math
 from tqdm import tqdm
 from torch_geometric.utils import softmax
 from torch_geometric.nn import GCNConv, GATConv
-
+import torch.utils.checkpoint as checkpoint  # [新增] 导入 checkpoint
 
 def get_cosine_schedule_buffers(timesteps, s=0.008):
     """
@@ -141,65 +141,60 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.ffn_norm = nn.LayerNorm(channels)
 
     def forward(self, x, context, edge_data):
-        # x 形状: (B*N, L, C)
-        # edge_index 形状: (2, E * B * L), 已经过批处理
+        # [核心修改] 封装内部前向传播逻辑以支持 Gradient Checkpointing
+        def _inner_forward(x, context, edge_index, edge_weight):
+            x_res = x
+            
+            if self.use_film and context is not None:
+                x = self.film_layer(x, context)
+            
+            # --- 空间注意力 (融合 GCN + GAT) ---
+            x_spatial_res = x
+            x_norm_spatial = self.spatial_norm(x)  # Pre-LN
 
-        # print(f"Debug(5): x shape: {x.shape}, edge_index shape: {edge_index.shape}")
-        # if context is not None:
-            # print(f"Debug(6): context shape: {context.shape}")
-        # x shape: torch.Size([550, 12, 64])
-        # context shape: torch.Size([550, 256])     定义了context_dim = model_dim * 4
+            BN, L, C = x_norm_spatial.shape
+            B = BN // 275
+            N = 275
+            x_reshaped = x_norm_spatial.reshape(B, N, L, C)
+            x_permuted = x_reshaped.permute(0, 2, 1, 3)
+            #  (B, L, N, C) -> (B*L*N, C) 以便GNN处理
+            x_flat = x_permuted.reshape(-1, C)
 
-        x_res = x
-        
-        if self.use_film and context is not None:
-            x = self.film_layer(x, context)
-        
-        # print(f"Debug(7): After FiLM, x shape: {x.shape}")
-        # After FiLM, x shape: torch.Size([550, 12, 64])    [550, 6, 128]  [550, 3, 256]...
+            # 这里的 edge_index, edge_weight 由外部参数传入
+            x_spatial = self.spatial_layer(x_flat, edge_index, edge_weight=edge_weight)  # (B*N*L, C)
 
+            x_spatial_reshaped = x_spatial.reshape(B, L, N, C)
+            x_spatial_permuted = x_spatial_reshaped.permute(0, 2, 1, 3)
+            x_spatial = x_spatial_permuted.reshape(BN, L, C)
 
-        # --- 空间注意力 (融合 GCN + GAT) ---
-        x_spatial_res = x
-        x_norm_spatial = self.spatial_norm(x)  # Pre-LN
-        # print(f"Debug(8): x_norm shape before flatten: {x_norm.shape}")
-        # x_norm shape before flatten: torch.Size([550, 12, 64])  [550, 6, 128]  [550, 3, 256]...
+            x = x_spatial_res + x_spatial  # 残差连接
 
-        BN, L, C = x_norm_spatial.shape
-        B=BN // 275
-        N=275
-        x_reshaped = x_norm_spatial.reshape(B,N, L, C)
-        x_permuted = x_reshaped.permute(0, 2, 1, 3)
-        #  (B, L, N, C) -> (B*L*N, C) 以便GNN处理
-        x_flat = x_permuted.reshape(-1, C)
+            # --- 时间注意力 (Pre-LN) ---
+            x_temporal_res = x
+            x_norm = self.temporal_norm(x)
+            x_attn, _ = self.temporal_attn(x_norm, x_norm, x_norm)
+            x = x_temporal_res + x_attn
 
-        # print(f"Debug(9): x_flat shape: {x_flat.shape}")
-        # x_flat shape: torch.Size([6600, 64])  [3300, 128]  [1650, 256]...
+            # --- 前馈网络 (Pre-LN) ---
+            x_ffn_res = x
+            x_norm = self.ffn_norm(x)
+            x_ffn = self.ffn(x_norm)
+            x = x_ffn_res + x_ffn
 
-        edge_index, edge_weight = edge_data
-        x_spatial = self.spatial_layer(x_flat, edge_index, edge_weight=edge_weight)  # (B*N*L, C)
-        # print(f"Debug(10): x_spatial shape after GCN_GAT_Layer: {x_spatial.shape}")
+            return x + x_res
 
-        x_spatial_reshaped = x_spatial.reshape(B, L, N, C)
-        x_spatial_permuted = x_spatial_reshaped.permute(0, 2, 1, 3)
-        x_spatial = x_spatial_permuted.reshape(BN, L, C)
-
-        x = x_spatial_res + x_spatial  # 残差连接
-
-        
-        # --- 时间注意力 (Pre-LN) ---
-        x_temporal_res = x
-        x_norm = self.temporal_norm(x)
-        x_attn, _ = self.temporal_attn(x_norm, x_norm, x_norm)
-        x = x_temporal_res + x_attn
-
-        # --- 前馈网络 (Pre-LN) ---
-        x_ffn_res = x
-        x_norm = self.ffn_norm(x)
-        x_ffn = self.ffn(x_norm)
-        x = x_ffn_res + x_ffn
-
-        return x + x_res
+        # [核心修改] 根据条件决定是否使用 checkpoint
+        # 1. 处于训练模式
+        # 2. 输入 x 需要梯度
+        if self.training and x.requires_grad:
+            # 拆包 edge_data，因为 checkpoint 只能接受 Tensor 参数
+            edge_index, edge_weight = edge_data
+            # use_reentrant=False 是推荐设置，可避免一些已知问题
+            return checkpoint.checkpoint(_inner_forward, x, context, edge_index, edge_weight, use_reentrant=False)
+        else:
+            # 验证模式或不需要梯度时，直接运行
+            edge_index, edge_weight = edge_data
+            return _inner_forward(x, context, edge_index, edge_weight)
 
 class ContextEncoder(nn.Module):
     """统一的上下文编码器 (已增加未来已知特征编码)。"""
