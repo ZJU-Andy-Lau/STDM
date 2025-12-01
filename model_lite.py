@@ -101,9 +101,27 @@ class FiLMLayer(nn.Module):
     def __init__(self, channels, context_dim):
         super().__init__()
         self.layer = nn.Linear(context_dim, channels * 2)
+        
     def forward(self, x, context):
-        gamma_beta = self.layer(context).unsqueeze(1).chunk(2, dim=-1)
-        gamma, beta = gamma_beta[0], gamma_beta[1]
+        """
+        x: (B, N, L, C)
+        context: (B*N, context_dim)
+        """
+        gamma_beta = self.layer(context) # (B*N, 2C)
+        
+        # [核心修复] ----------------------------------------------------
+        # 必须根据 x 的维度重塑 gamma_beta，否则无法广播
+        if x.dim() == 4:
+            B, N, L, C = x.shape
+            # 将 (B*N, 2C) -> (B, N, 1, 2C)
+            # 这里的 1 是为了对齐 L 维度进行广播
+            gamma_beta = gamma_beta.view(B, N, 1, -1)
+        else:
+            # 兼容其他可能的维度情况（虽然在本模型中主要就是4维）
+            gamma_beta = gamma_beta.unsqueeze(1)
+        # ---------------------------------------------------------------
+
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
         return gamma * x + beta
 
 class SpatioTemporalTransformerBlock(nn.Module):
@@ -137,16 +155,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         adj: (N, N) 密集矩阵
         """
         
-        # 预计算 Attention Mask (仅在第一次或设备变化时计算，但为了简单这里直接生成)
-        # adj 为 0 的地方设为 -inf，其他为 0
-        # 假设 adj 是 (N, N)
-        # 注意：这里我们动态生成 mask，因为显存开销极小
-        # 如果 adj 是 weighted，我们需要判断 0 值。
-        # 建议在外部传入 mask 更优，但为了接口简单，我们在内部处理
-        # 或者为了效率，在 main loop 中生成好 mask 传入。这里为了保持接口改动最小，我们传入 adj，并在 forward 中处理 mask。
-        # 为了性能，建议 adj 已经是处理过的，但在 Block 内部我们依然需要 mask。
-        # 优化：我们要求传入的 adj 是 Tensor。
-        
+        # 预计算 Attention Mask
         attn_mask = torch.zeros_like(adj)
         attn_mask[adj == 0] = float('-inf')
 
@@ -162,6 +171,8 @@ class SpatioTemporalTransformerBlock(nn.Module):
             # Input: (B, N, L, C)
             # Need: (B*L, N, C)
             B, N, L, C = x_norm_spatial.shape
+            
+            # 将 Batch 和 Time 维度合并，以利用广播机制同时处理所有时间步的图卷积
             x_flat = x_norm_spatial.permute(0, 2, 1, 3).reshape(B * L, N, C)
             
             x_spatial = self.spatial_layer(x_flat, adj, attn_mask)
@@ -223,8 +234,14 @@ class ContextEncoder(nn.Module):
 
     def forward(self, k, history_c, static_c, future_known_c, adj):
         t_emb = self.time_mlp(k)
-        history_c_proj = self.history_projection(history_c)
-        # History Encoder 也使用密集图
+        
+        # 1. 投影
+        history_c_proj = self.history_projection(history_c) # 形状目前是 (BN, L, C)
+        
+        # [修复] -----------------------------------------------------------
+        # Block 需要 (B, N, L, C) 4维输入
+        
+        # 从 adj 获取节点数 N (adj shape: [N, N])
         N = adj.shape[0]
         BN, L, C = history_c_proj.shape
         B = BN // N
@@ -232,13 +249,13 @@ class ContextEncoder(nn.Module):
         # 将 3D (BN, L, C) 重塑为 4D (B, N, L, C)
         history_c_reshaped = history_c_proj.reshape(B, N, L, C)
         
-        # 传入 Block 进行处理
-        # 输出形状也是 (B, N, L, C)
+        # 传入 Block 进行处理, context 为 None (因为正在生成 Context)
         hist_enc_out = self.history_encoder(history_c_reshaped, None, adj)
         
         # 我们只需要最后一个时间步的特征，并需要将其还原为 (BN, C) 以便后续融合
-        # 取最后一个时间步 -> (B, N, C) -> reshape -> (BN, C)
         hist_emb = hist_enc_out[:, :, -1, :].reshape(BN, C)
+        # ------------------------------------------------------------------
+
         static_emb = self.static_encoder(static_c)
         _, future_hidden_state = self.future_encoder(future_known_c)
         future_emb = future_hidden_state[-1]
@@ -260,11 +277,11 @@ class UGnetV2(nn.Module):
         dims = [model_dim]
         current_dim = model_dim
         
-        # --- 显存优化：限制最大通道数 ---
+        # 显存优化：限制最大通道数
         for _ in range(depth):
             self.down_blocks.append(SpatioTemporalTransformerBlock(current_dim, context_dim, num_heads))
             
-            # [修改] 限制下一层的通道数增长
+            # 限制下一层的通道数增长
             next_dim = min(current_dim * 2, max_channels)
             
             self.downsamples.append(Downsample(current_dim, next_dim))
@@ -287,10 +304,13 @@ class UGnetV2(nn.Module):
 
     def forward(self, x, context, adj):
         batch_size, num_nodes, seq_len, _ = x.shape
-        x = x.reshape(batch_size * num_nodes, seq_len, -1).permute(0, 2, 1)
+        # x input: (B, N, L, C)
+        
+        # Conv1d expects (Batch, Channels, Length). We treat (B*N) as batch.
+        x = x.reshape(batch_size * num_nodes, seq_len, -1).permute(0, 2, 1) # (BN, C, L)
         x = self.init_conv(x).permute(0, 2, 1) # (BN, L, C)
         
-        # Restore to (B, N, L, C) for ST-Block
+        # Restore to (B, N, L, C) for ST-Block which needs 4D input for DenseSpatialLayer
         x = x.reshape(batch_size, num_nodes, seq_len, -1)
         
         skip_connections = []
@@ -298,12 +318,10 @@ class UGnetV2(nn.Module):
             x = block(x, context, adj)
             skip_connections.append(x)
             
-            # Downsample: (B, N, L, C) -> permute -> Conv1d -> permute
+            # Downsample: (B, N, L, C) -> (BN, L, C) -> Conv1d -> (BN, L/2, C_out) -> (B, N, L/2, C_out)
             B, N, L, C = x.shape
             x_flat = x.reshape(B * N, L, C)
             x_down = downsampler(x_flat)
-            # Restore N dimension
-            # Downsample halves L
             x = x_down.reshape(B, N, -1, x_down.shape[-1])
 
         x = self.bottleneck(x, context, adj)
@@ -317,7 +335,7 @@ class UGnetV2(nn.Module):
             x = x_up.reshape(B, N, -1, x_up.shape[-1])
             
             skip = skip_connections[i]
-            # Interpolate if needed (usually handled by Upsample padding, but safety check)
+            # Interpolate if needed (safety check for odd lengths)
             if x.shape[2] != skip.shape[2]:
                  x_flat = x.reshape(B*N, x.shape[2], -1).permute(0, 2, 1)
                  x_flat = nn.functional.interpolate(x_flat, size=skip.shape[2], mode='linear', align_corners=False)
@@ -361,7 +379,7 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
             model_dim=model_dim,
             num_heads=num_heads,
             depth=depth,
-            max_channels=max_channels # 传递 max_channels
+            max_channels=max_channels 
         )
         
         betas = torch.linspace(1e-4, 0.02, T)
@@ -389,6 +407,7 @@ class SpatioTemporalDiffusionModelV2(nn.Module):
         if static_c.dim() == 3 and static_c.shape[0] == batch_size:
             static_c_flat = static_c.reshape(batch_size * num_nodes, -1)
         elif static_c.dim() == 2:
+            # (N, F) -> (B, N, F) -> (BN, F)
             static_c_flat = static_c.repeat(batch_size, 1)
         else:
             raise ValueError(f"Unexpected shape for static_c: {static_c.shape}.")
