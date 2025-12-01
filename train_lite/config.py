@@ -35,6 +35,7 @@ class ConfigV2:
     MEAN_MSE_LAMBDA = 10.0       
     INDIVIDUAL_L1_LAMBDA = 1.0   
     REPULSION_LAMBDA = 0.5
+    BIAS_SUM_LAMBDA = 2.0
     
     # 训练参数
     EPOCHS = 100

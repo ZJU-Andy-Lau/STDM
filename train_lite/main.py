@@ -314,10 +314,15 @@ def train():
                     x_j = pred_x0_grouped.unsqueeze(1)
                     pairwise_dist = (x_i - x_j).abs() 
                     loss_repulsion = (pairwise_dist * weights.unsqueeze(1)).mean()
+
+                    bias = pred_x0_grouped - target_x0_expanded
+                    sum_bias = bias.sum(dim=1, keepdim=True) # (B, 1, N, L, C)
+                    loss_bias_sum = (sum_bias.abs() * weights).mean()
                     
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                            cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1 - \
-                           cfg.REPULSION_LAMBDA * loss_repulsion
+                           cfg.REPULSION_LAMBDA * loss_repulsion + \
+                           cfg.BIAS_SUM_LAMBDA * loss_bias_sum
                     
                     loss = loss / cfg.ACCUMULATION_STEPS
 
