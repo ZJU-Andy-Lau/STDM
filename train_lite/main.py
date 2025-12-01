@@ -233,7 +233,8 @@ def train():
             
             with context:
                 with amp.autocast():
-                    # 1. 数据上 GPU (Batch Size, N, L, C)
+                    # 1. 数据上 GPU 
+                    # DataLoader 输出形状: (Batch, Length, Nodes, Channels)
                     hist_batch = history_c.to(device_id)
                     stat_batch = static_c.to(device_id)
                     future_batch = future_x0.to(device_id)
@@ -242,20 +243,25 @@ def train():
                     B = hist_batch.shape[0]
                     K = cfg.ENSEMBLE_K
 
-                    # 2. 扩展 Batch 以适配 Ensemble
-                    # 输入: (B, N, L, C)
-                    # 目标: (B*K, N, L, C) 
-                    # repeat_interleave(K, dim=0) 会将每个样本连续重复 K 次: [s1, s1, s2, s2...]
-                    hist_exp = hist_batch.repeat_interleave(K, dim=0) 
+                    # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
+                    # 输入: (B, L, N, C) -> 目标: (B*K, N, L, C)
+                    # repeat_interleave 会保留原维度，所以需要 permute
+                    
+                    # (B, L, N, C) -> (B*K, L, N, C) -> (B*K, N, L, C)
+                    hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                    
+                    # Static: (B, N, F) -> (B*K, N, F) (无 Time 维，无需 permute)
                     stat_exp = stat_batch.repeat_interleave(K, dim=0)
-                    future_exp = future_batch.repeat_interleave(K, dim=0)
-                    known_exp = known_batch.repeat_interleave(K, dim=0)
+                    
+                    # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
+                    future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                    known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
                     
                     # 3. 扩散过程
-                    noise = torch.randn_like(future_exp)
+                    noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
                     
                     # 生成时间步 t
-                    # 为每个 Batch 生成一个 t，然后重复 K 次，保证同一个样本的 K 个变体使用相同的 t 进行训练
+                    # 为每个 Batch 生成一个 t，然后重复 K 次
                     t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
                     t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
 
@@ -271,6 +277,7 @@ def train():
                     x_t.requires_grad_(True)
 
                     # 4. 模型预测 (传入密集图 adj_tensor)
+                    # 输入形状现在已确认为 (B*K, N, L, C)，与模型要求一致
                     predicted_noise = ddp_model(
                         x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
                     )
@@ -281,29 +288,29 @@ def train():
                     # Reshape 以分组: (B, K, N, L, C)
                     pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
                     
-                    # Target: (B, N, L, C) -> (B, 1, N, L, C)
-                    target_x0 = future_batch # (B, N, L, C)
-                    target_x0_expanded = target_x0.unsqueeze(1)
+                    # Target 准备: 
+                    # future_batch 是 (B, L, N, C)，必须转为 (B, N, L, C) 才能与 pred_x0_grouped (N, L) 对齐
+                    target_x0 = future_batch.permute(0, 2, 1, 3) # (B, N, L, C)
+                    target_x0_expanded = target_x0.unsqueeze(1) # (B, 1, N, L, C)
                     
-                    # Weights: (B*K) -> (B, K, 1, 1, 1) -> (B, 1, 1, 1, 1) (同一 Batch 权重相同)
+                    # Weights: (B*K) -> (B, K, 1, 1, 1) -> (B, 1, 1, 1, 1)
                     if dist.is_initialized():
                         alphas_cumprod = ddp_model.module.alphas_cumprod
                     else:
                         alphas_cumprod = ddp_model.alphas_cumprod
                         
                     weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
-                    weights = weights[:, 0:1, :, :, :] # 取每组第一个即可
+                    weights = weights[:, 0:1, :, :, :] 
                     
-                    # (1) Mean MSE: 组内均值逼近真值
-                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True) # (B, 1, N, L, C)
+                    # (1) Mean MSE
+                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True) 
                     loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
                     
-                    # (2) Individual L1: 每个样本逼近真值
+                    # (2) Individual L1
                     l1_dist = (pred_x0_grouped - target_x0_expanded).abs()
                     loss_individual_l1 = (l1_dist * weights).mean()
                     
-                    # (3) Repulsion: 组内样本互斥
-                    # Expand for pairwise: (B, K, 1, N, L, C) - (B, 1, K, N, L, C)
+                    # (3) Repulsion
                     x_i = pred_x0_grouped.unsqueeze(2)
                     x_j = pred_x0_grouped.unsqueeze(1)
                     pairwise_dist = (x_i - x_j).abs() 
@@ -313,23 +320,18 @@ def train():
                            cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1 - \
                            cfg.REPULSION_LAMBDA * loss_repulsion
                     
-                    # [关键] 除以 Accumulation Steps (mean 已经对 Batch 做了平均)
                     loss = loss / cfg.ACCUMULATION_STEPS
 
                 scaler.scale(loss).backward()
-                # 记录还原后的 loss
                 batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
 
             if is_grad_update_step:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                
-                # 当前 Step 的平均 Loss
                 avg_loss_step = batch_loss_tracker
                 total_train_loss += avg_loss_step 
-                batch_loss_tracker = 0.0 # Reset
-                
+                batch_loss_tracker = 0.0 
                 if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
             else:
                 pass
@@ -342,8 +344,16 @@ def train():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
                 with amp.autocast():
+                    # future_x0: (B, L, N, C) -> 需要调整为 (B, N, L, C)
+                    future_x0 = future_x0.permute(0, 2, 1, 3)
+                    # history_c: (B, L, N, C) -> (B, N, L, C)
+                    history_c = history_c.permute(0, 2, 1, 3)
+                    # future_known_c: (B, L, N, C) -> (B, N, L, C)
+                    future_known_c = future_known_c.permute(0, 2, 1, 3)
+                    
                     b = future_x0.shape[0]
-                    noise = torch.randn_like(future_x0)
+                    noise = torch.randn_like(future_x0) # (B, N, L, C)
+                    
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                     
                     if dist.is_initialized():
@@ -360,7 +370,6 @@ def train():
                     total_val_loss += val_loss.item()
 
         # --- Loss 聚合与日志 ---
-        # 计算每个 Update Step 的平均 Loss
         num_updates = len(train_dataloader) / cfg.ACCUMULATION_STEPS
         avg_train_loss_local = total_train_loss / max(num_updates, 1)
         
@@ -389,7 +398,6 @@ def train():
             }
             print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
             
-            # 保存最佳模型逻辑
             if avg_val_loss < best_val_loss:
                 second_best_val_loss = best_val_loss
                 best_val_loss = avg_val_loss
@@ -412,8 +420,13 @@ def train():
             current_val_mae = float('inf') 
             if rank == 0: print(f"Epoch {epoch+1}, running periodic MAE evaluation...")
             
-            # 调用 periodic_evaluate_mae (注意：传入 adj_tensor)
             model_to_eval = ddp_model.module if dist.is_initialized() else ddp_model
+            # Note: periodic_evaluate_mae already handles permute (L, N) -> (N, L) internally if it assumes (B, L, N, C) from Loader.
+            # But let's check evaluation.py again.
+            # It calls ddim_sample with .permute(0, 2, 1, 3).
+            # Our Loader gives (B, L, N, C).
+            # So .permute(0, 2, 1, 3) -> (B, N, L, C).
+            # This is CORRECT for our new model.
             current_val_seq_local = periodic_evaluate_mae(
                 model_to_eval, 
                 val_eval_loader,
@@ -435,13 +448,11 @@ def train():
 
             if rank == 0:
                 current_val_seq = np.concatenate(gathered_results, axis=0)
-                # 对齐样本数
                 current_val_seq = current_val_seq[:len(y_true_original)]
                 current_val_mae = np.mean(np.abs(current_val_seq - y_true_original))
                 epoch_log_data['avg_val_mae'] = current_val_mae
                 print(f"Avg Val MAE: {current_val_mae:.4f}")
 
-                # 保存 MAE 最佳模型
                 state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
                 
                 if current_val_mae < best_val_mae:
@@ -479,7 +490,6 @@ def train():
     
     best_model_path_synced, second_best_model_path_synced, best_model_path_for_val_synced, second_best_model_path_for_val_synced = path_list_to_eval
 
-    # 评估逻辑封装
     def run_eval(path, key_name, desc):
         if path and os.path.exists(path):
             if rank == 0: print(f"\n[ALL GPUS] Evaluating {desc}: {os.path.basename(path)}")
