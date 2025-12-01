@@ -26,10 +26,10 @@ class ConfigV2:
     
     # [显存优化核心] 限制最大通道数，防止深层特征爆炸
     # 结合 DEPTH=4，原逻辑会达到 1024，现在限制在 256
-    MAX_CHANNELS = 256
+    MAX_CHANNELS = 1024
     
     # --- 集成训练参数 ---
-    ENSEMBLE_K = 36          
+    ENSEMBLE_K = 8          
     
     # 损失函数权重配置
     MEAN_MSE_LAMBDA = 10.0       
