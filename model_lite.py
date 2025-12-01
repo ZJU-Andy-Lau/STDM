@@ -225,7 +225,20 @@ class ContextEncoder(nn.Module):
         t_emb = self.time_mlp(k)
         history_c_proj = self.history_projection(history_c)
         # History Encoder 也使用密集图
-        hist_emb = self.history_encoder(history_c_proj, None, adj)[:, -1, :]
+        N = adj.shape[0]
+        BN, L, C = history_c_proj.shape
+        B = BN // N
+        
+        # 将 3D (BN, L, C) 重塑为 4D (B, N, L, C)
+        history_c_reshaped = history_c_proj.reshape(B, N, L, C)
+        
+        # 传入 Block 进行处理
+        # 输出形状也是 (B, N, L, C)
+        hist_enc_out = self.history_encoder(history_c_reshaped, None, adj)
+        
+        # 我们只需要最后一个时间步的特征，并需要将其还原为 (BN, C) 以便后续融合
+        # 取最后一个时间步 -> (B, N, C) -> reshape -> (BN, C)
+        hist_emb = hist_enc_out[:, :, -1, :].reshape(BN, C)
         static_emb = self.static_encoder(static_c)
         _, future_hidden_state = self.future_encoder(future_known_c)
         future_emb = future_hidden_state[-1]
