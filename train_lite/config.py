@@ -29,7 +29,7 @@ class ConfigV2:
     MAX_CHANNELS = 256
     
     # --- 集成训练参数 ---
-    ENSEMBLE_K = 4          
+    ENSEMBLE_K = 36          
     
     # 损失函数权重配置
     MEAN_MSE_LAMBDA = 10.0       
@@ -40,7 +40,7 @@ class ConfigV2:
     EPOCHS = 100
     BATCH_SIZE = 4 # 优化后建议尝试开大，如 8 或 16
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 5
+    ACCUMULATION_STEPS = 4
 
     WARMUP_EPOCHS = 5      
     COOLDOWN_EPOCHS = 50    
