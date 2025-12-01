@@ -38,9 +38,9 @@ class ConfigV2:
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 16 # 优化后建议尝试开大，如 8 或 16
+    BATCH_SIZE = 8 # 优化后建议尝试开大，如 8 或 16
     LEARNING_RATE = 1e-4
-    ACCUMULATION_STEPS = 1
+    ACCUMULATION_STEPS = 2
 
     WARMUP_EPOCHS = 5      
     COOLDOWN_EPOCHS = 50    
