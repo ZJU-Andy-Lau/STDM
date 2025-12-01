@@ -35,7 +35,7 @@ except ImportError:
     from metrics import calculate_metrics, dm_test, print_metrics
 
 # 这里注意 model_sigma 需要从上级目录导入，运行 main.py 时路径会自动处理
-from model_sigma import SpatioTemporalDiffusionModelV2
+from model_avg import SpatioTemporalDiffusionModelV2
 
 @torch.no_grad()
 def periodic_evaluate_mae(model, loader, scaler, edge_index, edge_weights, cfg, device):
