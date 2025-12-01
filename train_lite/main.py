@@ -68,7 +68,6 @@ def train():
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         cfg.RUN_ID = run_id
         print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
-        print(f"Optimization: Dense Graph Ops + Batch Training + Max Channels {cfg.MAX_CHANNELS}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from tqdm import tqdm
-import torch.utils.checkpoint as checkpoint
+# [修改] 移除了 torch.utils.checkpoint 导入，因为不再需要梯度检查点
 
 def get_cosine_schedule_buffers(timesteps, s=0.008):
     steps = timesteps + 1
@@ -109,7 +109,6 @@ class FiLMLayer(nn.Module):
         """
         gamma_beta = self.layer(context) # (B*N, 2C)
         
-        # [核心修复] ----------------------------------------------------
         # 必须根据 x 的维度重塑 gamma_beta，否则无法广播
         if x.dim() == 4:
             B, N, L, C = x.shape
@@ -117,9 +116,8 @@ class FiLMLayer(nn.Module):
             # 这里的 1 是为了对齐 L 维度进行广播
             gamma_beta = gamma_beta.view(B, N, 1, -1)
         else:
-            # 兼容其他可能的维度情况（虽然在本模型中主要就是4维）
+            # 兼容其他可能的维度情况
             gamma_beta = gamma_beta.unsqueeze(1)
-        # ---------------------------------------------------------------
 
         gamma, beta = gamma_beta.chunk(2, dim=-1)
         return gamma * x + beta
@@ -131,7 +129,7 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.channels = channels
         self.num_heads = num_heads
         
-        # 替换为密集层
+        # 密集计算层
         self.spatial_layer = DenseSpatialLayer(channels, channels, heads=num_heads, dropout=0.1)
         
         self.spatial_norm = nn.LayerNorm(channels)
@@ -158,51 +156,50 @@ class SpatioTemporalTransformerBlock(nn.Module):
         # 预计算 Attention Mask
         attn_mask = torch.zeros_like(adj)
         attn_mask[adj == 0] = float('-inf')
+        
+        # 保存最外层的残差基准
+        x_res = x
+        
+        # 1. FiLM 条件调制
+        if self.use_film and context is not None:
+            x = self.film_layer(x, context)
+        
+        # 2. Spatial Layer (空间依赖)
+        x_spatial_res = x
+        x_norm_spatial = self.spatial_norm(x)
+        
+        # Input: (B, N, L, C)
+        # Need: (B*L, N, C) for Spatial Layer
+        B, N, L, C = x_norm_spatial.shape
+        
+        # 将 Batch 和 Time 维度合并，以利用广播机制同时处理所有时间步的图卷积
+        x_flat = x_norm_spatial.permute(0, 2, 1, 3).reshape(B * L, N, C)
+        
+        x_spatial = self.spatial_layer(x_flat, adj, attn_mask)
+        
+        # Restore: (B*L, N, C) -> (B, L, N, C) -> (B, N, L, C)
+        x_spatial = x_spatial.reshape(B, L, N, C).permute(0, 2, 1, 3)
+        x = x_spatial_res + x_spatial
 
-        def _inner_forward(x, context, adj, attn_mask):
-            x_res = x
-            if self.use_film and context is not None:
-                x = self.film_layer(x, context)
-            
-            x_spatial_res = x
-            x_norm_spatial = self.spatial_norm(x)
-            
-            # --- Spatial Layer (密集计算) ---
-            # Input: (B, N, L, C)
-            # Need: (B*L, N, C)
-            B, N, L, C = x_norm_spatial.shape
-            
-            # 将 Batch 和 Time 维度合并，以利用广播机制同时处理所有时间步的图卷积
-            x_flat = x_norm_spatial.permute(0, 2, 1, 3).reshape(B * L, N, C)
-            
-            x_spatial = self.spatial_layer(x_flat, adj, attn_mask)
-            
-            # Restore: (B*L, N, C) -> (B, L, N, C) -> (B, N, L, C)
-            x_spatial = x_spatial.reshape(B, L, N, C).permute(0, 2, 1, 3)
-            x = x_spatial_res + x_spatial
+        # 3. Temporal Layer (时间依赖)
+        x_temporal_res = x
+        x_norm = self.temporal_norm(x)
+        
+        # Input to MHA: (Batch*Nodes, Seq, Channels)
+        # 这里的 reshape 将 (B, N, L, C) 变为 (B*N, L, C)
+        x_norm_temp = x_norm.reshape(B * N, L, C)
+        x_attn, _ = self.temporal_attn(x_norm_temp, x_norm_temp, x_norm_temp)
+        x_attn = x_attn.reshape(B, N, L, C)
+        x = x_temporal_res + x_attn
 
-            # --- Temporal Layer ---
-            x_temporal_res = x
-            x_norm = self.temporal_norm(x)
-            # Input to MHA: (Batch*Nodes, Seq, Channels)
-            x_norm_temp = x_norm.reshape(B * N, L, C)
-            x_attn, _ = self.temporal_attn(x_norm_temp, x_norm_temp, x_norm_temp)
-            x_attn = x_attn.reshape(B, N, L, C)
-            x = x_temporal_res + x_attn
-
-            # --- FFN ---
-            x_ffn_res = x
-            x_norm = self.ffn_norm(x)
-            x_ffn = self.ffn(x_norm)
-            x = x_ffn_res + x_ffn
-            
-            return x + x_res
-
-        # Gradient Checkpointing
-        if self.training and x.requires_grad:
-            return checkpoint.checkpoint(_inner_forward, x, context, adj, attn_mask, use_reentrant=False)
-        else:
-            return _inner_forward(x, context, adj, attn_mask)
+        # 4. FFN (前馈网络)
+        x_ffn_res = x
+        x_norm = self.ffn_norm(x)
+        x_ffn = self.ffn(x_norm)
+        x = x_ffn_res + x_ffn
+        
+        # 添加最外层的残差 (ResNet 风格)
+        return x + x_res
 
 class ContextEncoder(nn.Module):
     def __init__(self, time_dim, history_dim, static_dim, future_known_dim, model_dim, context_dim, num_heads):
@@ -238,7 +235,6 @@ class ContextEncoder(nn.Module):
         # 1. 投影
         history_c_proj = self.history_projection(history_c) # 形状目前是 (BN, L, C)
         
-        # [修复] -----------------------------------------------------------
         # Block 需要 (B, N, L, C) 4维输入
         
         # 从 adj 获取节点数 N (adj shape: [N, N])
@@ -249,12 +245,11 @@ class ContextEncoder(nn.Module):
         # 将 3D (BN, L, C) 重塑为 4D (B, N, L, C)
         history_c_reshaped = history_c_proj.reshape(B, N, L, C)
         
-        # 传入 Block 进行处理, context 为 None (因为正在生成 Context)
+        # 传入 Block 进行处理, context 为 None
         hist_enc_out = self.history_encoder(history_c_reshaped, None, adj)
         
         # 我们只需要最后一个时间步的特征，并需要将其还原为 (BN, C) 以便后续融合
         hist_emb = hist_enc_out[:, :, -1, :].reshape(BN, C)
-        # ------------------------------------------------------------------
 
         static_emb = self.static_encoder(static_c)
         _, future_hidden_state = self.future_encoder(future_known_c)
