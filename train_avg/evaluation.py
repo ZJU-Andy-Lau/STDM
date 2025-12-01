@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore")
 import torch
 import numpy as np
 import os
