@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from tqdm import tqdm
-# [修改] 移除了 torch.utils.checkpoint 导入，因为不再需要梯度检查点
+import torch.utils.checkpoint as checkpoint
 
 def get_cosine_schedule_buffers(timesteps, s=0.008):
     steps = timesteps + 1
@@ -156,50 +156,53 @@ class SpatioTemporalTransformerBlock(nn.Module):
         # 预计算 Attention Mask
         attn_mask = torch.zeros_like(adj)
         attn_mask[adj == 0] = float('-inf')
-        
-        # 保存最外层的残差基准
-        x_res = x
-        
-        # 1. FiLM 条件调制
-        if self.use_film and context is not None:
-            x = self.film_layer(x, context)
-        
-        # 2. Spatial Layer (空间依赖)
-        x_spatial_res = x
-        x_norm_spatial = self.spatial_norm(x)
-        
-        # Input: (B, N, L, C)
-        # Need: (B*L, N, C) for Spatial Layer
-        B, N, L, C = x_norm_spatial.shape
-        
-        # 将 Batch 和 Time 维度合并，以利用广播机制同时处理所有时间步的图卷积
-        x_flat = x_norm_spatial.permute(0, 2, 1, 3).reshape(B * L, N, C)
-        
-        x_spatial = self.spatial_layer(x_flat, adj, attn_mask)
-        
-        # Restore: (B*L, N, C) -> (B, L, N, C) -> (B, N, L, C)
-        x_spatial = x_spatial.reshape(B, L, N, C).permute(0, 2, 1, 3)
-        x = x_spatial_res + x_spatial
 
-        # 3. Temporal Layer (时间依赖)
-        x_temporal_res = x
-        x_norm = self.temporal_norm(x)
-        
-        # Input to MHA: (Batch*Nodes, Seq, Channels)
-        # 这里的 reshape 将 (B, N, L, C) 变为 (B*N, L, C)
-        x_norm_temp = x_norm.reshape(B * N, L, C)
-        x_attn, _ = self.temporal_attn(x_norm_temp, x_norm_temp, x_norm_temp)
-        x_attn = x_attn.reshape(B, N, L, C)
-        x = x_temporal_res + x_attn
+        # 定义内部前向传播函数，用于 checkpoint
+        def _inner_forward(x, context, adj, attn_mask):
+            x_res = x
+            if self.use_film and context is not None:
+                x = self.film_layer(x, context)
+            
+            x_spatial_res = x
+            x_norm_spatial = self.spatial_norm(x)
+            
+            # --- Spatial Layer (密集计算) ---
+            # Input: (B, N, L, C)
+            # Need: (B*L, N, C) for Spatial Layer
+            B, N, L, C = x_norm_spatial.shape
+            
+            # 将 Batch 和 Time 维度合并
+            x_flat = x_norm_spatial.permute(0, 2, 1, 3).reshape(B * L, N, C)
+            
+            x_spatial = self.spatial_layer(x_flat, adj, attn_mask)
+            
+            # Restore: (B*L, N, C) -> (B, L, N, C) -> (B, N, L, C)
+            x_spatial = x_spatial.reshape(B, L, N, C).permute(0, 2, 1, 3)
+            x = x_spatial_res + x_spatial
 
-        # 4. FFN (前馈网络)
-        x_ffn_res = x
-        x_norm = self.ffn_norm(x)
-        x_ffn = self.ffn(x_norm)
-        x = x_ffn_res + x_ffn
-        
-        # 添加最外层的残差 (ResNet 风格)
-        return x + x_res
+            # --- Temporal Layer ---
+            x_temporal_res = x
+            x_norm = self.temporal_norm(x)
+            # Input to MHA: (Batch*Nodes, Seq, Channels)
+            x_norm_temp = x_norm.reshape(B * N, L, C)
+            x_attn, _ = self.temporal_attn(x_norm_temp, x_norm_temp, x_norm_temp)
+            x_attn = x_attn.reshape(B, N, L, C)
+            x = x_temporal_res + x_attn
+
+            # --- FFN ---
+            x_ffn_res = x
+            x_norm = self.ffn_norm(x)
+            x_ffn = self.ffn(x_norm)
+            x = x_ffn_res + x_ffn
+            
+            return x + x_res
+
+        # [恢复] Gradient Checkpointing 逻辑
+        if self.training and x.requires_grad:
+            # 使用 use_reentrant=False 是推荐做法，可以减少一些潜在的副作用
+            return checkpoint.checkpoint(_inner_forward, x, context, adj, attn_mask, use_reentrant=False)
+        else:
+            return _inner_forward(x, context, adj, attn_mask)
 
 class ContextEncoder(nn.Module):
     def __init__(self, time_dim, history_dim, static_dim, future_known_dim, model_dim, context_dim, num_heads):
