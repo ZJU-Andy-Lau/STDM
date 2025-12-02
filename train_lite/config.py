@@ -32,15 +32,15 @@ class ConfigV2:
     ENSEMBLE_K = 8          
     
     # 损失函数权重配置
-    MEAN_MSE_LAMBDA = 10.0       
+    MEAN_MSE_LAMBDA = 1.0       
     INDIVIDUAL_L1_LAMBDA = 1.0   
-    REPULSION_LAMBDA = 0.5
-    BIAS_SUM_LAMBDA = 2.0
+    REPULSION_LAMBDA = 0.1
+    BIAS_SUM_LAMBDA = 1.0
     
     # 训练参数
     EPOCHS = 100
     BATCH_SIZE = 16 # 优化后建议尝试开大，如 8 或 16
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 2e-4
     ACCUMULATION_STEPS = 1
 
     WARMUP_EPOCHS = 5      
