@@ -318,11 +318,18 @@ def train():
                     bias = pred_x0_grouped - target_x0_expanded
                     sum_bias = bias.sum(dim=1, keepdim=True) # (B, 1, N, L, C)
                     loss_bias_sum = (sum_bias.abs() * weights).mean()
+
+                    ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True) # [1, C, N, L]
+                    true_squared_error = (ensemble_mean.detach() - target_x0)**2 
+                    
+                    # 使用 Huber Loss 或 L1 Loss 来对齐方差和误差
+                    loss_var_align = (torch.abs(ensemble_var - true_squared_error) * weights).mean()
                     
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                            cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1 - \
                            cfg.REPULSION_LAMBDA * loss_repulsion + \
-                           cfg.BIAS_SUM_LAMBDA * loss_bias_sum
+                           cfg.BIAS_SUM_LAMBDA * loss_bias_sum + \
+                           cfg.VAR_LAMBDA * loss_var_align
                     
                     loss = loss / cfg.ACCUMULATION_STEPS
 
