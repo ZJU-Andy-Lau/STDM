@@ -323,7 +323,7 @@ def train():
                     true_squared_error = (ensemble_mean.detach() - target_x0)**2 
                     
                     # 使用 Huber Loss 或 L1 Loss 来对齐方差和误差
-                    loss_var_align = (torch.abs(ensemble_var - true_squared_error) * weights).mean()
+                    loss_var_align = (torch.abs(torch.sqrt(ensemble_var) - torch.sqrt(true_squared_error)) * weights).mean()
                     
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                            cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1 - \

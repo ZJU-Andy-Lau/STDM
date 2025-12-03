@@ -36,7 +36,7 @@ class ConfigV2:
     INDIVIDUAL_L1_LAMBDA = 1.0   
     REPULSION_LAMBDA = 0.5
     BIAS_SUM_LAMBDA = 1.0
-    VAR_LAMBDA = 0.5
+    VAR_LAMBDA = 0.1
     
     # 训练参数
     EPOCHS = 100
