@@ -34,9 +34,9 @@ class ConfigV2:
     # 损失函数权重配置
     MEAN_MSE_LAMBDA = 1.0       
     INDIVIDUAL_L1_LAMBDA = 1.0   
-    REPULSION_LAMBDA = 0.5
+    REPULSION_LAMBDA = 1.0
     BIAS_SUM_LAMBDA = 1.0
-    VAR_LAMBDA = 0.1
+    VAR_LAMBDA = 0.5
     
     # 训练参数
     EPOCHS = 100
