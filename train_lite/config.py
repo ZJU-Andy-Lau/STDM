@@ -36,7 +36,7 @@ class ConfigV2:
     MEAN_MSE_LAMBDA = 1.0       
     
     # 2. Energy Score: 严格评分规则，负责优化整体分布形状 (准确性 + 多样性)
-    ENERGY_LAMBDA = 0.1         
+    ENERGY_LAMBDA = 1.0         
     
     # 3. Gaussian NLL: 强制拉开不确定性区间，防止方差坍塌 (权重建议较小)
     NLL_LAMBDA = 0.01           
