@@ -69,6 +69,7 @@ def train():
         cfg.RUN_ID = run_id
         print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
+        print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA})")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
@@ -233,7 +234,6 @@ def train():
             with context:
                 with amp.autocast():
                     # 1. 数据上 GPU 
-                    # DataLoader 输出形状: (Batch, Length, Nodes, Channels)
                     hist_batch = history_c.to(device_id)
                     stat_batch = static_c.to(device_id)
                     future_batch = future_x0.to(device_id)
@@ -243,13 +243,10 @@ def train():
                     K = cfg.ENSEMBLE_K
 
                     # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
-                    # 输入: (B, L, N, C) -> 目标: (B*K, N, L, C)
-                    # repeat_interleave 会保留原维度，所以需要 permute
-                    
-                    # (B, L, N, C) -> (B*K, L, N, C) -> (B*K, N, L, C)
+                    # (B, L, N, C) -> (B*K, N, L, C)
                     hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
                     
-                    # Static: (B, N, F) -> (B*K, N, F) (无 Time 维，无需 permute)
+                    # Static: (B, N, F) -> (B*K, N, F) 
                     stat_exp = stat_batch.repeat_interleave(K, dim=0)
                     
                     # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
@@ -260,7 +257,6 @@ def train():
                     noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
                     
                     # 生成时间步 t
-                    # 为每个 Batch 生成一个 t，然后重复 K 次
                     t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
                     t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
 
@@ -275,24 +271,22 @@ def train():
                     x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
                     x_t.requires_grad_(True)
 
-                    # 4. 模型预测 (传入密集图 adj_tensor)
-                    # 输入形状现在已确认为 (B*K, N, L, C)，与模型要求一致
+                    # 4. 模型预测
                     predicted_noise = ddp_model(
                         x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
                     )
                     
-                    # 5. Loss 计算 (Batch Ensemble Loss)
+                    # 5. Loss 计算 (New Strategy: Energy + MeanMSE + NLL)
                     pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
                     
                     # Reshape 以分组: (B, K, N, L, C)
                     pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
                     
-                    # Target 准备: 
-                    # future_batch 是 (B, L, N, C)，必须转为 (B, N, L, C) 才能与 pred_x0_grouped (N, L) 对齐
-                    target_x0 = future_batch.permute(0, 2, 1, 3) # (B, N, L, C)
-                    target_x0_expanded = target_x0.unsqueeze(1) # (B, 1, N, L, C)
+                    # Target 准备: (B, 1, N, L, C)
+                    target_x0 = future_batch.permute(0, 2, 1, 3) 
+                    target_x0_expanded = target_x0.unsqueeze(1) 
                     
-                    # Weights: (B*K) -> (B, K, 1, 1, 1) -> (B, 1, 1, 1, 1)
+                    # Weights: (B, 1, 1, 1, 1)
                     if dist.is_initialized():
                         alphas_cumprod = ddp_model.module.alphas_cumprod
                     else:
@@ -300,36 +294,49 @@ def train():
                         
                     weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
                     weights = weights[:, 0:1, :, :, :] 
-                    
-                    # (1) Mean MSE
-                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True) 
+
+                    # --- [Part 1] 统计量计算 ---
+                    # 均值 (B, 1, N, L, C)
+                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                    # 方差 (B, 1, N, L, C), 使用 clamp 避免除零，1e-6 确保数值稳定
+                    ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                    ensemble_var = torch.clamp(ensemble_var, min=1e-6)
+
+                    # --- [Part 2] Mean MSE Loss (定海神针) ---
+                    # 确保分布的中心对齐真值，防止漂移
                     loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
-                    
-                    # (2) Individual L1
-                    l1_dist = (pred_x0_grouped - target_x0_expanded).abs()
-                    loss_individual_l1 = (l1_dist * weights).mean()
-                    
-                    # (3) Repulsion
-                    x_i = pred_x0_grouped.unsqueeze(2)
-                    x_j = pred_x0_grouped.unsqueeze(1)
-                    pairwise_dist = (x_i - x_j).abs() 
-                    loss_repulsion = (pairwise_dist * weights.unsqueeze(1)).mean()
 
-                    bias = pred_x0_grouped - target_x0_expanded
-                    sum_bias = bias.sum(dim=1, keepdim=True) # (B, 1, N, L, C)
-                    loss_bias_sum = (sum_bias.abs() * weights).mean()
+                    # --- [Part 3] Energy Loss (CRPS 推广 - 总指挥) ---
+                    # Energy Score = E||X-y|| - 0.5 * E||X-X'||
+                    
+                    # 3.1 准确性项 (Accuracy): ||X - y||
+                    # Norm 在特征维度 (dim=-1) 计算, 然后对 K 个样本取平均 (dim=1) -> 结果 (B, N, L)
+                    es_accuracy = (pred_x0_grouped - target_x0_expanded).norm(p=2, dim=-1).mean(dim=1)
+                    
+                    # 3.2 多样性项 (Diversity): ||X_i - X_j||
+                    # Pairwise difference: (B, K, 1, N, L, C) - (B, 1, K, N, L, C) -> (B, K, K, N, L, C)
+                    dist_matrix = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                    # Norm -> (B, K, K, N, L)
+                    dist_norm = dist_matrix.norm(p=2, dim=-1)
+                    # Mean over K*K pairs -> (B, N, L)
+                    es_diversity = dist_norm.mean(dim=(1, 2))
+                    
+                    # 3.3 组合 Energy Loss
+                    # 将 (B, N, L) 扩展为 (B, 1, N, L, 1) 以匹配 weights 维度进行加权
+                    es_combined = es_accuracy - 0.5 * es_diversity
+                    loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
-                    ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True) # [1, C, N, L]
-                    true_squared_error = (ensemble_mean.detach() - target_x0)**2 
-                    
-                    # 使用 Huber Loss 或 L1 Loss 来对齐方差和误差
-                    loss_var_align = (torch.abs(torch.sqrt(ensemble_var) - torch.sqrt(true_squared_error)) * weights).mean()
-                    
+                    # --- [Part 4] Gaussian NLL Loss (方差扩张器) ---
+                    # NLL = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
+                    # 这一项对 var 极度敏感，能强力惩罚 var 过小的情况
+                    sq_error = (target_x0_expanded - ensemble_mean)**2
+                    nll_per_element = 0.5 * torch.log(ensemble_var) + 0.5 * sq_error / ensemble_var
+                    loss_nll = (nll_per_element * weights).mean()
+
+                    # --- [Part 5] 总 Loss 组合 ---
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
-                           cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1 - \
-                           cfg.REPULSION_LAMBDA * loss_repulsion + \
-                           cfg.BIAS_SUM_LAMBDA * loss_bias_sum + \
-                           cfg.VAR_LAMBDA * loss_var_align
+                           cfg.ENERGY_LAMBDA * loss_energy + \
+                           cfg.NLL_LAMBDA * loss_nll
                     
                     loss = loss / cfg.ACCUMULATION_STEPS
 
@@ -432,12 +439,6 @@ def train():
             if rank == 0: print(f"Epoch {epoch+1}, running periodic MAE evaluation...")
             
             model_to_eval = ddp_model.module if dist.is_initialized() else ddp_model
-            # Note: periodic_evaluate_mae already handles permute (L, N) -> (N, L) internally if it assumes (B, L, N, C) from Loader.
-            # But let's check evaluation.py again.
-            # It calls ddim_sample with .permute(0, 2, 1, 3).
-            # Our Loader gives (B, L, N, C).
-            # So .permute(0, 2, 1, 3) -> (B, N, L, C).
-            # This is CORRECT for our new model.
             current_val_seq_local = periodic_evaluate_mae(
                 model_to_eval, 
                 val_eval_loader,

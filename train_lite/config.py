@@ -31,16 +31,25 @@ class ConfigV2:
     # --- 集成训练参数 ---
     ENSEMBLE_K = 8          
     
-    # 损失函数权重配置
+    # --- 损失函数权重配置 (Updated for Energy + NLL Strategy) ---
+    # 1. Mean MSE: 锚定分布中心，保证基础预测精度
     MEAN_MSE_LAMBDA = 1.0       
-    INDIVIDUAL_L1_LAMBDA = 1.0   
-    REPULSION_LAMBDA = 0.5
-    BIAS_SUM_LAMBDA = 1.0
-    VAR_LAMBDA = 0.2
+    
+    # 2. Energy Score: 严格评分规则，负责优化整体分布形状 (准确性 + 多样性)
+    ENERGY_LAMBDA = 0.1         
+    
+    # 3. Gaussian NLL: 强制拉开不确定性区间，防止方差坍塌 (权重建议较小)
+    NLL_LAMBDA = 0.01           
+    
+    # Deprecated / Unused (设为 0.0 以禁用旧的冲突 Loss)
+    INDIVIDUAL_L1_LAMBDA = 0.0   
+    REPULSION_LAMBDA = 0.0
+    BIAS_SUM_LAMBDA = 0.0
+    VAR_LAMBDA = 0.0
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 16 # 优化后建议尝试开大，如 8 或 16
+    BATCH_SIZE = 16 
     LEARNING_RATE = 1e-3
     ACCUMULATION_STEPS = 1
 
