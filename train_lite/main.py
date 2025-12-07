@@ -300,7 +300,7 @@ def train():
                     ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
                     # 方差 (B, 1, N, L, C), 使用 clamp 避免除零，1e-6 确保数值稳定
                     ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
-                    ensemble_var = torch.clamp(ensemble_var, min=1e-6)
+                    ensemble_var = torch.clamp(ensemble_var, min=1e-4)
 
                     # --- [Part 2] Mean MSE Loss (定海神针) ---
                     # 确保分布的中心对齐真值，防止漂移
@@ -330,8 +330,8 @@ def train():
                     # NLL = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
                     # 这一项对 var 极度敏感，能强力惩罚 var 过小的情况
                     sq_error = (target_x0_expanded - ensemble_mean)**2
-                    nll_per_element = 0.5 * torch.log(ensemble_var) + 0.5 * sq_error / ensemble_var
-                    loss_nll = (nll_per_element * weights).mean()
+                    nll_per_element = 0.5 * torch.log(ensemble_var) + 0.5 * sq_error / (ensemble_var + 1e-8)
+                    loss_nll = (torch.clamp(nll_per_element,max=1e4) * weights).mean()
 
                     # --- [Part 5] 总 Loss 组合 ---
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
