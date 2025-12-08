@@ -311,20 +311,15 @@ def train():
                     # --- [Part 3] Energy Loss (CRPS 推广 - 总指挥) ---
                     # Energy Score = E||X-y|| - 0.5 * E||X-X'||
                     
-                    # 3.1 准确性项 (Accuracy): ||X - y||
-                    # Norm 在特征维度 (dim=-1) 计算, 然后对 K 个样本取平均 (dim=1) -> 结果 (B, N, L)
-                    es_accuracy = (pred_x0_grouped - target_x0_expanded).norm(p=2, dim=-1).mean(dim=1)
+                    eps_safe = 1e-6
+                    diff = pred_x0_grouped - target_x0_expanded
+                    sum_sq = diff.pow(2).sum(dim=-1) 
+                    es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
                     
-                    # 3.2 多样性项 (Diversity): ||X_i - X_j||
-                    # Pairwise difference: (B, K, 1, N, L, C) - (B, 1, K, N, L, C) -> (B, K, K, N, L, C)
-                    dist_matrix = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
-                    # Norm -> (B, K, K, N, L)
-                    dist_norm = dist_matrix.norm(p=2, dim=-1)
-                    # Mean over K*K pairs -> (B, N, L)
-                    es_diversity = dist_norm.mean(dim=(1, 2))
+                    diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                    sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                    es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
                     
-                    # 3.3 组合 Energy Loss
-                    # 将 (B, N, L) 扩展为 (B, 1, N, L, 1) 以匹配 weights 维度进行加权
                     es_combined = es_accuracy - 0.5 * es_diversity
                     loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
@@ -382,11 +377,11 @@ def train():
                         # Energy
                         diff_dbg = pred_x0_grouped_dbg - target_x0_expanded
                         sum_sq_dbg = diff_dbg.pow(2).sum(dim=-1)
-                        es_acc_dbg = torch.sqrt(sum_sq_dbg).mean(dim=1)
+                        es_acc_dbg = torch.sqrt(sum_sq_dbg + eps_safe).mean(dim=1)
                         
                         diff_div_dbg = pred_x0_grouped_dbg.unsqueeze(2) - pred_x0_grouped_dbg.unsqueeze(1)
                         sum_sq_div_dbg = diff_div_dbg.pow(2).sum(dim=-1)
-                        es_div_dbg = torch.sqrt(sum_sq_div_dbg).mean(dim=(1, 2))
+                        es_div_dbg = torch.sqrt(sum_sq_div_dbg + eps_safe).mean(dim=(1, 2))
                         
                         l_energy = ((es_acc_dbg - 0.5 * es_div_dbg).unsqueeze(1).unsqueeze(-1) * weights).mean()
                         
