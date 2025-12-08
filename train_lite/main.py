@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import sys
 import os
+import copy  # [New] 用于状态备份
 
 current_file_path = os.path.abspath(__file__)
 current_dir = os.path.dirname(current_file_path)
@@ -70,6 +71,7 @@ def train():
         print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
         print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA})")
+        print(f"Resilient Strategy: Rollback on NaN enabled.")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
@@ -209,148 +211,204 @@ def train():
 
     debugger = NanDebugger(ddp_model, logger=print if rank == 0 else lambda x: None)
 
-    # --- 训练循环 ---
+    # --- 训练循环 (含回滚机制) ---
+    max_retries = 3
+
     for epoch in range(cfg.EPOCHS):
-        if dist.is_initialized():
-            train_sampler.set_epoch(epoch)
-            
-        ddp_model.train()
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS} [Train]", disable=(rank != 0))
-        total_train_loss = 0.0
-        batch_loss_tracker = 0.0
-        optimizer.zero_grad()
+        # [Checkpoint] 在 Epoch 开始前，保存当前状态到内存
+        if rank == 0:
+            print(f"Creating snapshot for Epoch {epoch+1}...")
+        
+        # 使用 copy.deepcopy 保存状态字典到 CPU 内存
+        # 注意: state_dict 里面的 tensor 默认在 GPU 上，如果显存紧张，可以考虑 .cpu() 但会增加 I/O
+        # 这里为了速度，我们直接 deepcopy。如果 OOM，可以改为 {k: v.cpu() for k, v in ...}
+        snapshot = {
+            'model': copy.deepcopy(ddp_model.state_dict()),
+            'optimizer': copy.deepcopy(optimizer.state_dict()),
+            'scheduler': copy.deepcopy(scheduler.state_dict()),
+            'scaler': copy.deepcopy(scaler.state_dict())
+        }
 
-        for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
-            # 判断是否是梯度更新步
-            is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+        retry_count = 0
+        epoch_success = False
+        
+        while not epoch_success:
+            if retry_count >= max_retries:
+                if rank == 0:
+                    print(f"[CRITICAL] Max retries ({max_retries}) reached at Epoch {epoch+1}. Stopping training.")
+                return # 彻底停止训练
+
+            if retry_count > 0:
+                if rank == 0:
+                    print(f"--- [Retry] Restarting Epoch {epoch+1} (Attempt {retry_count + 1}/{max_retries + 1}) ---")
             
-            # DDP 上下文管理 (Accumulation 时不同步梯度)
-            if is_grad_update_step:
-                context = nullcontext()
-            else:
-                if dist.is_initialized():
-                    context = ddp_model.no_sync()
-                else:
+            # 设置 sampler epoch，加入 retry_count 偏移，确保重试时数据 shuffle 不同
+            if dist.is_initialized():
+                train_sampler.set_epoch(epoch + retry_count * 100)
+                
+            ddp_model.train()
+            optimizer.zero_grad() # 确保开始前清理梯度
+            
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS} [Train]", disable=(rank != 0))
+            total_train_loss = 0.0
+            batch_loss_tracker = 0.0
+            
+            nan_detected_in_epoch = False # 标记本轮次是否遇到 NaN
+
+            for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
+                # 判断是否是梯度更新步
+                is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+                
+                # DDP 上下文管理 (Accumulation 时不同步梯度)
+                if is_grad_update_step:
                     context = nullcontext()
-            
-            with context:
-                with amp.autocast():
-                    # 1. 数据上 GPU 
-                    hist_batch = history_c.to(device_id)
-                    stat_batch = static_c.to(device_id)
-                    future_batch = future_x0.to(device_id)
-                    known_batch = future_known_c.to(device_id)
-                    
-                    B = hist_batch.shape[0]
-                    K = cfg.ENSEMBLE_K
-
-                    # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
-                    # (B, L, N, C) -> (B*K, N, L, C)
-                    hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
-                    
-                    # Static: (B, N, F) -> (B*K, N, F) 
-                    stat_exp = stat_batch.repeat_interleave(K, dim=0)
-                    
-                    # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
-                    future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                    known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                    
-                    # 3. 扩散过程
-                    noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
-                    
-                    # 生成时间步 t
-                    t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
-                    t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
-
-                    # 获取 alpha_bar
+                else:
                     if dist.is_initialized():
-                        sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                        context = ddp_model.no_sync()
                     else:
-                        sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                    
-                    x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
-                    x_t.requires_grad_(True)
-
-                    # 4. 模型预测
-                    predicted_noise = ddp_model(
-                        x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
-                    )
-                    
-                    # 5. Loss 计算 (New Strategy: Energy + MeanMSE + NLL)
-                    pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
-                    
-                    # Reshape 以分组: (B, K, N, L, C)
-                    pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                    
-                    # Target 准备: (B, 1, N, L, C)
-                    target_x0 = future_batch.permute(0, 2, 1, 3) 
-                    target_x0_expanded = target_x0.unsqueeze(1) 
-                    
-                    # Weights: (B, 1, 1, 1, 1)
-                    if dist.is_initialized():
-                        alphas_cumprod = ddp_model.module.alphas_cumprod
-                    else:
-                        alphas_cumprod = ddp_model.alphas_cumprod
+                        context = nullcontext()
+                
+                with context:
+                    with amp.autocast():
+                        # 1. 数据上 GPU 
+                        hist_batch = history_c.to(device_id)
+                        stat_batch = static_c.to(device_id)
+                        future_batch = future_x0.to(device_id)
+                        known_batch = future_known_c.to(device_id)
                         
-                    weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
-                    weights = weights[:, 0:1, :, :, :] 
+                        B = hist_batch.shape[0]
+                        K = cfg.ENSEMBLE_K
 
-                    # --- [Part 1] 统计量计算 ---
-                    # 均值 (B, 1, N, L, C)
-                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
-                    ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
-                    ensemble_var = torch.clamp(ensemble_var, min=1e-4)
+                        # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
+                        hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                        stat_exp = stat_batch.repeat_interleave(K, dim=0)
+                        future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        
+                        # 3. 扩散过程
+                        noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
+                        t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
+                        t_exp = t_per_sample.repeat_interleave(K) 
 
-                    loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
+                        if dist.is_initialized():
+                            sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                        else:
+                            sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                        
+                        x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
+                        x_t.requires_grad_(True)
 
-                    eps_safe = 1e-6
-                    diff = pred_x0_grouped - target_x0_expanded
-                    sum_sq = diff.pow(2).sum(dim=-1) 
-                    es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
-                    
-                    diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
-                    sum_sq_div = diff_div.pow(2).sum(dim=-1)
-                    es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
-                    
-                    es_combined = es_accuracy - 0.5 * es_diversity
-                    loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
+                        # 4. 模型预测
+                        predicted_noise = ddp_model(
+                            x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
+                        )
+                        
+                        # 5. Loss 计算
+                        pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                        pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                        target_x0 = future_batch.permute(0, 2, 1, 3) 
+                        target_x0_expanded = target_x0.unsqueeze(1) 
+                        
+                        if dist.is_initialized():
+                            alphas_cumprod = ddp_model.module.alphas_cumprod
+                        else:
+                            alphas_cumprod = ddp_model.alphas_cumprod
+                            
+                        weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
+                        weights = weights[:, 0:1, :, :, :] 
 
-                    sq_error = (target_x0_expanded - ensemble_mean)**2
-                    nll_term1 = 0.5 * torch.log(ensemble_var)
-                    nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
-                    nll_per_element = nll_term1 + nll_term2
-                    nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
-                    loss_nll = (nll_per_element_clamped * weights).mean()
+                        ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                        ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                        ensemble_var = torch.clamp(ensemble_var, min=1e-4)
 
-                    loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
-                           cfg.ENERGY_LAMBDA * loss_energy + \
-                           cfg.NLL_LAMBDA * loss_nll
-                    
-                    loss = loss / cfg.ACCUMULATION_STEPS
+                        loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"[Rank {rank}] NaN Loss Detected! Starting diagnosis...")
-                        debugger.diagnose_loss_detail(pred_x0_grouped, target_x0_expanded, weights)
-                        break
+                        eps_safe = 1e-6
+                        diff = pred_x0_grouped - target_x0_expanded
+                        sum_sq = diff.pow(2).sum(dim=-1) 
+                        es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
+                        
+                        diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                        sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                        es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
+                        
+                        es_combined = es_accuracy - 0.5 * es_diversity
+                        loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
-                scaler.scale(loss).backward()
-                batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
+                        sq_error = (target_x0_expanded - ensemble_mean)**2
+                        nll_term1 = 0.5 * torch.log(ensemble_var)
+                        nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
+                        nll_per_element = nll_term1 + nll_term2
+                        nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
+                        loss_nll = (nll_per_element_clamped * weights).mean()
 
-            if is_grad_update_step:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                        loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
+                               cfg.ENERGY_LAMBDA * loss_energy + \
+                               cfg.NLL_LAMBDA * loss_nll
+                        
+                        loss = loss / cfg.ACCUMULATION_STEPS
+
+                        # --- [New] Resilient NaN Check & DDP Sync ---
+                        is_nan_local = torch.tensor(0.0, device=device_id)
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            is_nan_local = torch.tensor(1.0, device=device_id)
+                            # 可以在这里打印本地 Log
+                            print(f"[Rank {rank}] NaN detected at Batch {i}!")
+
+                        # DDP All-Reduce: 只要任何一个 Rank 发现 NaN (MAX > 0)，所有 Rank 都将感知
+                        if dist.is_initialized():
+                            dist.all_reduce(is_nan_local, op=dist.ReduceOp.MAX)
+                        
+                        if is_nan_local.item() > 0.5:
+                            nan_detected_in_epoch = True
+                            if rank == 0:
+                                print(f"[Alert] NaN detected globally at Epoch {epoch+1}, Batch {i}. Initiating rollback...")
+                                # 可以调用 debugger 打印详细信息（可选）
+                                # debugger.diagnose_loss_detail(pred_x0_grouped, target_x0_expanded, weights)
+                            break # 跳出 Batch 循环
+
+                    scaler.scale(loss).backward()
+                    batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
+
+                if is_grad_update_step:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    avg_loss_step = batch_loss_tracker
+                    total_train_loss += avg_loss_step 
+                    batch_loss_tracker = 0.0 
+                    if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
+                else:
+                    pass
+            
+            # --- Batch 循环结束或中断后 ---
+            if nan_detected_in_epoch:
+                # 执行回滚逻辑
+                retry_count += 1
+                
+                # 恢复状态
+                if rank == 0: print("Restoring model/optimizer/scheduler/scaler state...")
+                ddp_model.load_state_dict(snapshot['model'])
+                optimizer.load_state_dict(snapshot['optimizer'])
+                scheduler.load_state_dict(snapshot['scheduler'])
+                scaler.load_state_dict(snapshot['scaler'])
+                
+                # 清理
                 optimizer.zero_grad()
-                avg_loss_step = batch_loss_tracker
-                total_train_loss += avg_loss_step 
-                batch_loss_tracker = 0.0 
-                if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
+                torch.cuda.empty_cache()
+                
+                # Continue while 循环 -> 重新开始 Epoch
+                continue
             else:
-                pass
+                # 成功完成当前 Epoch
+                epoch_success = True
 
+        # --- 如果 Epoch 成功，进入验证环节 ---
+        
         # --- 验证循环 ---
         ddp_model.eval()
         total_val_loss = 0
@@ -359,15 +417,12 @@ def train():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
                 with amp.autocast():
-                    # future_x0: (B, L, N, C) -> 需要调整为 (B, N, L, C)
                     future_x0 = future_x0.permute(0, 2, 1, 3)
-                    # history_c: (B, L, N, C) -> (B, N, L, C)
                     history_c = history_c.permute(0, 2, 1, 3)
-                    # future_known_c: (B, L, N, C) -> (B, N, L, C)
                     future_known_c = future_known_c.permute(0, 2, 1, 3)
                     
                     b = future_x0.shape[0]
-                    noise = torch.randn_like(future_x0) # (B, N, L, C)
+                    noise = torch.randn_like(future_x0) 
                     
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                     
