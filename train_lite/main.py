@@ -31,13 +31,13 @@ from torch.utils.data.distributed import DistributedSampler
 
 try:
     from train_lite.config import ConfigV2
-    from train_lite.utils import CsvLogger, calc_layer_lengths
+    from train_lite.utils import CsvLogger, NanDebugger
     from train_lite.dataset import EVChargerDatasetV2, create_sliding_windows
     from train_lite.metrics import print_metrics
     from train_lite.evaluation import periodic_evaluate_mae, evaluate_model
 except ImportError:
     from config import ConfigV2
-    from utils import CsvLogger, calc_layer_lengths
+    from utils import CsvLogger, NanDebugger
     from dataset import EVChargerDatasetV2, create_sliding_windows
     from metrics import print_metrics
     from evaluation import periodic_evaluate_mae, evaluate_model
@@ -207,6 +207,8 @@ def train():
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
 
+    debugger = NanDebugger(ddp_model, logger=print if rank == 0 else lambda x: None)
+
     # --- 训练循环 ---
     for epoch in range(cfg.EPOCHS):
         if dist.is_initialized():
@@ -331,7 +333,7 @@ def train():
                     # 这一项对 var 极度敏感，能强力惩罚 var 过小的情况
                     sq_error = (target_x0_expanded - ensemble_mean)**2
                     nll_per_element = 0.5 * torch.log(ensemble_var) + 0.5 * sq_error / (ensemble_var + 1e-8)
-                    loss_nll = (torch.clamp(nll_per_element,max=1e4) * weights).mean()
+                    loss_nll = (torch.clamp(nll_per_element,min=-1e4,max=1e4) * weights).mean()
 
                     # --- [Part 5] 总 Loss 组合 ---
                     loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
@@ -340,10 +342,72 @@ def train():
                     
                     loss = loss / cfg.ACCUMULATION_STEPS
 
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"[Rank {rank}] NaN Loss Detected! Starting diagnosis...")
+                        debugger.diagnose_loss_detail(pred_x0_grouped, target_x0_expanded, weights)
+                        break
+
                 scaler.scale(loss).backward()
                 batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
 
             if is_grad_update_step:
+                scaler.unscale_(optimizer)
+
+            # ===================================================检测梯度中是否存在nan===================================================
+                grads_are_nan = False
+                for p in ddp_model.parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        grads_are_nan = True
+                        break
+                
+                if grads_are_nan:
+                    print(f"[Rank {rank}] NaN Gradients Detected! Triggering Re-Forward for Source Attribution...")
+                    
+                    # --- 重跑一次 Forward 以构建计算图进行诊断 ---
+                    # 必须 zero_grad 以清除当前的 NaN 梯度
+                    optimizer.zero_grad()
+                    
+                    with amp.autocast():
+                        # 重复计算过程 (利用相同的输入数据)
+                        predicted_noise_dbg = ddp_model(x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor)
+                        
+                        pred_x0_exp_dbg = (x_t - sqrt_one_minus_alpha_bar * predicted_noise_dbg) / (sqrt_alpha_bar + 1e-8)
+                        pred_x0_grouped_dbg = pred_x0_exp_dbg.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                        
+                        # 重算各部分 Loss (保持与上面逻辑完全一致)
+                        # Mean MSE
+                        ens_mean_dbg = pred_x0_grouped_dbg.mean(dim=1, keepdim=True)
+                        l_mean_mse = ((ens_mean_dbg - target_x0_expanded)**2 * weights).mean()
+                        
+                        # Energy
+                        diff_dbg = pred_x0_grouped_dbg - target_x0_expanded
+                        sum_sq_dbg = diff_dbg.pow(2).sum(dim=-1)
+                        es_acc_dbg = torch.sqrt(sum_sq_dbg).mean(dim=1)
+                        
+                        diff_div_dbg = pred_x0_grouped_dbg.unsqueeze(2) - pred_x0_grouped_dbg.unsqueeze(1)
+                        sum_sq_div_dbg = diff_div_dbg.pow(2).sum(dim=-1)
+                        es_div_dbg = torch.sqrt(sum_sq_div_dbg).mean(dim=(1, 2))
+                        
+                        l_energy = ((es_acc_dbg - 0.5 * es_div_dbg).unsqueeze(1).unsqueeze(-1) * weights).mean()
+                        
+                        # NLL
+                        ens_var_dbg = torch.clamp(pred_x0_grouped_dbg.var(dim=1, unbiased=True, keepdim=True), min=1e-4)
+                        sq_err_dbg = (target_x0_expanded - ens_mean_dbg)**2
+                        nll_raw = 0.5 * torch.log(ens_var_dbg) + 0.5 * sq_err_dbg / (ens_var_dbg + 1e-8)
+                        l_nll = (torch.clamp(nll_raw, max=100.0) * weights).mean()
+                        
+                        loss_dict_debug = {
+                            'mean_mse': l_mean_mse,
+                            'energy': l_energy,
+                            'nll': l_nll
+                        }
+                        
+                        # 调用调试器进行归因
+                        debugger.diagnose_gradient_source(loss_dict_debug)
+                        break # 诊断完成后退出
+            # ==========================================================================================================================
+
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
