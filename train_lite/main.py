@@ -259,6 +259,14 @@ def train():
             for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
                 # 判断是否是梯度更新步
                 is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+
+                for name, param in ddp_model.named_parameters():
+                    if torch.isnan(param).any():
+                        print(f"[FATAL] Parameter {name} contains NaN BEFORE forward pass! Previous update was bad.")
+                        break
+                    if torch.isinf(param).any():
+                        print(f"[FATAL] Parameter {name} contains Inf BEFORE forward pass!")
+                        break
                 
                 # DDP 上下文管理 (Accumulation 时不同步梯度)
                 if is_grad_update_step:
@@ -305,6 +313,9 @@ def train():
                         predicted_noise = ddp_model(
                             x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
                         )
+
+                        if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
+                            print(f"[FATAL] Model output contains NaN/Inf! Inputs or Layers unstable.")
                         
                         # 5. Loss 计算
                         pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
