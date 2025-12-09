@@ -12,8 +12,6 @@ if project_root not in sys.path:
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-import warnings
-warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -207,9 +205,7 @@ def train():
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
 
-    max_retries = 3
-    torch.autograd.set_detect_anomaly(True) # 开启 Anomaly Detection
-
+    # --- 训练循环 ---
     for epoch in range(cfg.EPOCHS):
         if dist.is_initialized():
             train_sampler.set_epoch(epoch)
@@ -220,28 +216,29 @@ def train():
         batch_loss_tracker = 0.0
         optimizer.zero_grad()
 
-            for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
-                is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+        for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
+            # 判断是否是梯度更新步
+            is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+            
+            # DDP 上下文管理 (Accumulation 时不同步梯度)
+            if is_grad_update_step:
+                context = nullcontext()
+            else:
+                if dist.is_initialized():
+                    context = ddp_model.no_sync()
+                else:
+                    context = nullcontext()
+            
+            with context:
+                # with amp.autocast():
+                # 1. 数据上 GPU 
+                hist_batch = history_c.to(device_id)
+                stat_batch = static_c.to(device_id)
+                future_batch = future_x0.to(device_id)
+                known_batch = future_known_c.to(device_id)
                 
-                # 在 Forward 之前检查一次参数，确认是否已经被上一步污染
-                for name, param in ddp_model.named_parameters():
-                    if torch.isnan(param).any():
-                        print(f"[FATAL-LOOP-START] Parameter {name} contains NaN at start of batch {i}! Rollback failed or previous step leaked.")
-                        nan_detected_in_epoch = True
-                        break
-                if nan_detected_in_epoch: break
-
-                context = nullcontext() if is_grad_update_step else (ddp_model.no_sync() if dist.is_initialized() else nullcontext())
-                
-                try:
-                    with context:
-                        hist_batch = history_c.to(device_id)
-                        stat_batch = static_c.to(device_id)
-                        future_batch = future_x0.to(device_id)
-                        known_batch = future_known_c.to(device_id)
-                        
-                        B = hist_batch.shape[0]
-                        K = cfg.ENSEMBLE_K
+                B = hist_batch.shape[0]
+                K = cfg.ENSEMBLE_K
 
                 # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
                 # (B, L, N, C) -> (B*K, N, L, C)
@@ -354,67 +351,20 @@ def train():
                 
                 loss = loss / cfg.ACCUMULATION_STEPS
 
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            print(f"[Rank {rank}] Loss became NaN at Batch {i} (FP32 calculation).")
-                            nan_detected_in_epoch = True
+                # scaler.scale(loss).backward()
+                loss.backward()
+                batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
 
-                    if not nan_detected_in_epoch:
-                        loss.backward()
-                        batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
-                        
-                        # --- [DEBUG TOOL 3] 梯度监理 (Gradient Supervisor) ---
-                        if is_grad_update_step:
-                            has_nan_grad = False
-                            for name, param in ddp_model.named_parameters():
-                                if param.grad is not None:
-                                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                        print(f"\n[DEBUG-GRAD] Parameter '{name}' has NaN/Inf gradient!")
-                                        has_nan_grad = True
-                                    
-                                    grad_norm = param.grad.norm().item()
-                                    if grad_norm > 100.0:
-                                        print(f"[DEBUG-GRAD] Parameter '{name}' has large grad norm: {grad_norm:.4f}")
-                            
-                            if has_nan_grad:
-                                print(f"[DEBUG-GRAD] Batch {i}: Gradient explosion detected. Stopping batch.")
-                                nan_detected_in_epoch = True
-                                optimizer.zero_grad() 
-
-                    if is_grad_update_step and not nan_detected_in_epoch:
-                        torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        avg_loss_step = batch_loss_tracker
-                        total_train_loss += avg_loss_step 
-                        batch_loss_tracker = 0.0 
-                        if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
-                
-                except RuntimeError as e:
-                    if "NaN" in str(e) or "Inf" in str(e):
-                        print(f"[EXCEPTION CAUGHT] {e}")
-                        nan_detected_in_epoch = True
-                    else:
-                        raise e
-
-                # DDP Sync Logic for Rollback
-                is_nan_local = torch.tensor(1.0 if nan_detected_in_epoch else 0.0, device=device_id)
-                if dist.is_initialized():
-                    dist.all_reduce(is_nan_local, op=dist.ReduceOp.MAX)
-                
-                if is_nan_local.item() > 0.5:
-                    nan_detected_in_epoch = True
-                    break 
-
-            if nan_detected_in_epoch:
-                retry_count += 1
-                if rank == 0: print("Restoring state...")
-                ddp_model.load_state_dict(snapshot['model'])
-                optimizer.load_state_dict(snapshot['optimizer'])
-                scheduler.load_state_dict(snapshot['scheduler'])
-                scaler.load_state_dict(snapshot['scaler'])
+            if is_grad_update_step:
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
+                # scaler.step(optimizer)
+                # scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
-                torch.cuda.empty_cache()
-                continue
+                avg_loss_step = batch_loss_tracker
+                total_train_loss += avg_loss_step 
+                batch_loss_tracker = 0.0 
+                if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
             else:
                 pass
 
