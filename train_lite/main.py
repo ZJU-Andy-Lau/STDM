@@ -2,7 +2,8 @@ import warnings
 warnings.filterwarnings("ignore")
 import sys
 import os
-import copy  # [New] 用于状态备份
+import copy
+import math
 
 current_file_path = os.path.abspath(__file__)
 current_dir = os.path.dirname(current_file_path)
@@ -13,8 +14,6 @@ if project_root not in sys.path:
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-import warnings
-warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -46,9 +45,61 @@ except ImportError:
 from model_lite import SpatioTemporalDiffusionModelV2
 from scheduler import MultiStageOneCycleLR
 
+# --- [DEBUG TOOL 1] 层级 NaN 监控器 ---
+class LayerNanMonitor:
+    def __init__(self, model):
+        self.hooks = []
+        # 递归注册 Hook 到每一个计算子模块
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Conv1d, nn.Linear, nn.MultiheadAttention, nn.LayerNorm, nn.GroupNorm, nn.Embedding)):
+                self.hooks.append(
+                    module.register_forward_hook(self._get_hook(name))
+                )
+    
+    def _get_hook(self, name):
+        def hook(module, input, output):
+            # 1. 检查权重 (Weights)
+            if hasattr(module, 'weight') and module.weight is not None:
+                if torch.isnan(module.weight).any():
+                    print(f"\n[DEBUG-FATAL] Layer '{name}' WEIGHT contains NaN!")
+                    raise RuntimeError(f"NaN weights detected at layer: {name}")
+                if torch.isinf(module.weight).any():
+                    print(f"\n[DEBUG-FATAL] Layer '{name}' WEIGHT contains Inf!")
+                    raise RuntimeError(f"Inf weights detected at layer: {name}")
+
+            # 2. 检查输入 (Input)
+            # input 是一个 tuple
+            for i, inp in enumerate(input):
+                if inp is not None and isinstance(inp, torch.Tensor):
+                    if torch.isnan(inp).any():
+                        print(f"\n[DEBUG-FATAL] Layer '{name}' INPUT[{i}] contains NaN!")
+                        raise RuntimeError(f"NaN input detected at layer: {name}")
+            
+            # 3. 检查输出 (Output)
+            if isinstance(output, tuple):
+                out_tensor = output[0]
+            else:
+                out_tensor = output
+            
+            if torch.isnan(out_tensor).any():
+                print(f"\n[DEBUG-FATAL] Layer '{name}' OUTPUT produced NaN!")
+                # 打印更多调试信息
+                if hasattr(module, 'weight'):
+                    print(f" - Weight stats: min={module.weight.min()}, max={module.weight.max()}")
+                print(f" - Input stats: min={input[0].min() if len(input)>0 else 'N/A'}, max={input[0].max() if len(input)>0 else 'N/A'}")
+                raise RuntimeError(f"NaN output detected at layer: {name}")
+            
+            if torch.isinf(out_tensor).any():
+                print(f"\n[DEBUG-FATAL] Layer '{name}' OUTPUT produced Inf!")
+                raise RuntimeError(f"Inf output detected at layer: {name}")
+        return hook
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+
 def train():
     # --- DDP 初始化 ---
-    # 检查是否在 DDP 环境中
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
         rank = int(os.environ["RANK"])
@@ -56,7 +107,6 @@ def train():
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(device_id)
     else:
-        # 单机 fallback (用于调试)
         print("Warning: Not running in DDP mode. Fallback to single GPU.")
         rank = 0
         device_id = 0
@@ -68,15 +118,12 @@ def train():
     if rank == 0:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         cfg.RUN_ID = run_id
-        print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
+        print(f"Starting Training (Debug Mode). Run ID: {cfg.RUN_ID}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
-        print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA})")
-        print(f"Resilient Strategy: Rollback on NaN enabled.")
-        print(f"Precision Strategy: AMP for Forward, Float32 for Loss.")
+        print(f"Strategies: Energy Loss + Resilient Rollback + Float32 Loss + Gradient Supervision")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
-        # 路径模板
         model_save_path_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="best")
         model_save_path_second_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="second_best")
         model_save_path_mae_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="mae_best")
@@ -95,7 +142,6 @@ def train():
         best_model_path_for_val = None
         second_best_model_path_for_val = None
 
-    # 同步 RUN_ID
     if dist.is_initialized():
         run_id_list = [cfg.RUN_ID]
         dist.broadcast_object_list(run_id_list, src=0)
@@ -105,20 +151,16 @@ def train():
             scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
             scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
 
-    # 日志
     log_headers = ['epoch', 'avg_train_loss', 'avg_val_loss', 'lr', 'avg_val_mae']
     csv_logger = CsvLogger(log_dir='./results', run_id=cfg.RUN_ID, rank=rank, headers=log_headers)
 
-    # --- 加载密集图 ---
     adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
     distances = adj_matrix[adj_matrix > 0]
     sigma = np.std(distances)
     adj_matrix = np.exp(-np.square(adj_matrix) / (sigma**2))
     adj_matrix[adj_matrix < 0.1] = 0
-    # 转换为 Tensor，不生成 edge_index
     adj_tensor = torch.from_numpy(adj_matrix).float().to(device_id)
 
-    # --- 数据加载 ---
     train_features = np.load(cfg.TRAIN_FEATURES_PATH)
     val_features = np.load(cfg.VAL_FEATURES_PATH)
     
@@ -140,7 +182,6 @@ def train():
     )
     
     if rank == 0:
-        print(f"Train Dataset Size: {len(train_dataset)}, Steps per Epoch: {len(train_dataloader)}")
         if cfg.NORMALIZATION_TYPE != "none":
             scaler_y, scaler_mm, scaler_z = train_dataset.get_scaler()
             joblib.dump(scaler_y, scaler_y_save_path)
@@ -186,7 +227,6 @@ def train():
         sampler=val_eval_sampler
     )
 
-    # --- 模型初始化 ---
     model = SpatioTemporalDiffusionModelV2(
         in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
         history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES, future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM,
@@ -199,6 +239,12 @@ def train():
     else:
         ddp_model = model
 
+    # --- [DEBUG] 激活层级 NaN 监控器 ---
+    # 这会在每次 Forward 时检查，性能略有损耗但对调试是必须的
+    if rank == 0:
+        print("Initializing LayerNanMonitor...")
+    nan_monitor = LayerNanMonitor(ddp_model)
+
     optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
     scaler = amp.GradScaler()
 
@@ -210,18 +256,13 @@ def train():
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
 
-    debugger = NanDebugger(ddp_model, logger=print if rank == 0 else lambda x: None)
-
-    # --- 训练循环 (含回滚机制) ---
     max_retries = 10
-    # torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(True) # 开启 Anomaly Detection
 
     for epoch in range(cfg.EPOCHS):
-        # [Checkpoint] 在 Epoch 开始前，保存当前状态到内存
         if rank == 0:
             print(f"Creating snapshot for Epoch {epoch+1}...")
         
-        # 使用 copy.deepcopy 保存状态字典到 CPU 内存
         snapshot = {
             'model': copy.deepcopy(ddp_model.state_dict()),
             'optimizer': copy.deepcopy(optimizer.state_dict()),
@@ -235,216 +276,206 @@ def train():
         while not epoch_success:
             if retry_count >= max_retries:
                 if rank == 0:
-                    print(f"[CRITICAL] Max retries ({max_retries}) reached at Epoch {epoch+1}. Stopping training.")
-                return # 彻底停止训练
+                    print(f"[CRITICAL] Max retries ({max_retries}) reached. Stopping.")
+                return 
 
             if retry_count > 0:
                 if rank == 0:
-                    print(f"--- [Retry] Restarting Epoch {epoch+1} (Attempt {retry_count + 1}/{max_retries + 1}) ---")
+                    print(f"--- [Retry] Restarting Epoch {epoch+1} (Attempt {retry_count + 1}) ---")
             
-            # 设置 sampler epoch，加入 retry_count 偏移，确保重试时数据 shuffle 不同
             if dist.is_initialized():
                 train_sampler.set_epoch(epoch + retry_count * 100)
                 
             ddp_model.train()
-            optimizer.zero_grad() # 确保开始前清理梯度
+            optimizer.zero_grad()
             
-            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS} [Train]", disable=(rank != 0))
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1} [Train]", disable=(rank != 0))
             total_train_loss = 0.0
             batch_loss_tracker = 0.0
-            
-            nan_detected_in_epoch = False # 标记本轮次是否遇到 NaN
+            nan_detected_in_epoch = False 
 
             for i, (history_c, static_c, future_x0, future_known_c, idx) in enumerate(progress_bar):
-                # 判断是否是梯度更新步
                 is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
-
+                
+                # 在 Forward 之前检查一次参数，确认是否已经被上一步污染
                 for name, param in ddp_model.named_parameters():
                     if torch.isnan(param).any():
-                        print(f"[FATAL] Parameter {name} contains NaN BEFORE forward pass! Previous update was bad.")
+                        print(f"[FATAL-LOOP-START] Parameter {name} contains NaN at start of batch {i}! Rollback failed or previous step leaked.")
+                        nan_detected_in_epoch = True
                         break
-                    if torch.isinf(param).any():
-                        print(f"[FATAL] Parameter {name} contains Inf BEFORE forward pass!")
-                        break
+                if nan_detected_in_epoch: break
+
+                context = nullcontext() if is_grad_update_step else (ddp_model.no_sync() if dist.is_initialized() else nullcontext())
                 
-                # DDP 上下文管理 (Accumulation 时不同步梯度)
-                if is_grad_update_step:
-                    context = nullcontext()
-                else:
-                    if dist.is_initialized():
-                        context = ddp_model.no_sync()
+                try:
+                    with context:
+                        with amp.autocast():
+                            hist_batch = history_c.to(device_id)
+                            stat_batch = static_c.to(device_id)
+                            future_batch = future_x0.to(device_id)
+                            known_batch = future_known_c.to(device_id)
+                            
+                            B = hist_batch.shape[0]
+                            K = cfg.ENSEMBLE_K
+
+                            hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                            stat_exp = stat_batch.repeat_interleave(K, dim=0)
+                            future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                            known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                            
+                            noise = torch.randn_like(future_exp)
+                            t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
+                            t_exp = t_per_sample.repeat_interleave(K) 
+
+                            if dist.is_initialized():
+                                sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                                sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            else:
+                                sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                                sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            
+                            x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
+                            x_t.requires_grad_(True)
+
+                            # Forward (NanMonitor 会在这里工作)
+                            predicted_noise = ddp_model(
+                                x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
+                            )
+
+                        # Loss 计算 (Float32)
+                        with amp.autocast(enabled=False):
+                            predicted_noise_fp32 = predicted_noise.float()
+                            x_t_fp32 = x_t.float()
+                            
+                            if dist.is_initialized():
+                                sqrt_alpha_bar_fp32 = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                                sqrt_one_minus_alpha_bar_fp32 = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                                alphas_cumprod_fp32 = ddp_model.module.alphas_cumprod.float()
+                            else:
+                                sqrt_alpha_bar_fp32 = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                                sqrt_one_minus_alpha_bar_fp32 = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                                alphas_cumprod_fp32 = ddp_model.alphas_cumprod.float()
+
+                            pred_x0_exp = (x_t_fp32 - sqrt_one_minus_alpha_bar_fp32 * predicted_noise_fp32) / (sqrt_alpha_bar_fp32 + 1e-8)
+                            pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                            target_x0 = future_batch.permute(0, 2, 1, 3).float()
+                            target_x0_expanded = target_x0.unsqueeze(1) 
+                            
+                            weights = alphas_cumprod_fp32[t_exp].view(B, K, 1, 1, 1)
+                            weights = weights[:, 0:1, :, :, :] 
+
+                            ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                            ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                            ensemble_var = torch.clamp(ensemble_var, min=1e-4)
+
+                            loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
+
+                            # --- Energy Score Calculation with Probe ---
+                            eps_safe = 1e-8
+                            diff = pred_x0_grouped - target_x0_expanded
+                            sum_sq = diff.pow(2).sum(dim=-1) 
+                            es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
+                            
+                            diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                            sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                            
+                            # --- [DEBUG TOOL 2] 多样性数值探针 ---
+                            min_div_val = sum_sq_div.min().item()
+                            if min_div_val < 1e-9:
+                                print(f"\n[DEBUG-ENERGY] Batch {i}: Diversity term (sum_sq) is extremely small: {min_div_val:.4e}")
+                                print("This will likely cause Infinite Gradients in backward pass!")
+
+                            es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
+                            
+                            es_combined = es_accuracy - 0.5 * es_diversity
+                            loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
+
+                            sq_error = (target_x0_expanded - ensemble_mean)**2
+                            nll_term1 = 0.5 * torch.log(ensemble_var)
+                            nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
+                            nll_per_element = nll_term1 + nll_term2
+                            nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
+                            loss_nll = (nll_per_element_clamped * weights).mean()
+
+                            loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
+                                   cfg.ENERGY_LAMBDA * loss_energy + \
+                                   cfg.NLL_LAMBDA * loss_nll
+                            
+                            loss = loss / cfg.ACCUMULATION_STEPS
+
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                print(f"[Rank {rank}] Loss became NaN at Batch {i} (FP32 calculation).")
+                                nan_detected_in_epoch = True
+
+                        if not nan_detected_in_epoch:
+                            scaler.scale(loss).backward()
+                            batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
+                            
+                            # --- [DEBUG TOOL 3] 梯度监理 (Gradient Supervisor) ---
+                            # 在 unscale 之前或之后检查皆可，这里我们为了安全，先检查是否有 Nan
+                            # 注意：Scaler 可能会在 step 时处理 NaN，但我们要看到底是谁产生的
+                            if is_grad_update_step:
+                                scaler.unscale_(optimizer) # 先 unscale 以查看真实梯度值
+                                has_nan_grad = False
+                                for name, param in ddp_model.named_parameters():
+                                    if param.grad is not None:
+                                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                            print(f"\n[DEBUG-GRAD] Parameter '{name}' has NaN/Inf gradient!")
+                                            has_nan_grad = True
+                                        
+                                        # 可选：打印梯度 Norm 过大的情况
+                                        grad_norm = param.grad.norm().item()
+                                        if grad_norm > 100.0:
+                                            print(f"[DEBUG-GRAD] Parameter '{name}' has large grad norm: {grad_norm:.4f}")
+                                
+                                if has_nan_grad:
+                                    print(f"[DEBUG-GRAD] Batch {i}: Gradient explosion detected. Stopping batch.")
+                                    nan_detected_in_epoch = True
+                                    # 不要 step，直接触发回滚
+                                    optimizer.zero_grad() 
+
+                    if is_grad_update_step and not nan_detected_in_epoch:
+                        torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                        avg_loss_step = batch_loss_tracker
+                        total_train_loss += avg_loss_step 
+                        batch_loss_tracker = 0.0 
+                        if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
+                
+                except RuntimeError as e:
+                    if "NaN" in str(e) or "Inf" in str(e):
+                        print(f"[EXCEPTION CAUGHT] {e}")
+                        nan_detected_in_epoch = True
                     else:
-                        context = nullcontext()
+                        raise e
+
+                # DDP Sync Logic for Rollback
+                is_nan_local = torch.tensor(1.0 if nan_detected_in_epoch else 0.0, device=device_id)
+                if dist.is_initialized():
+                    dist.all_reduce(is_nan_local, op=dist.ReduceOp.MAX)
                 
-                with context:
-                    # 1. 前向传播 (Forward) - 保持在 AMP 混合精度下运行
-                    with amp.autocast():
-                        # 数据上 GPU 
-                        hist_batch = history_c.to(device_id)
-                        stat_batch = static_c.to(device_id)
-                        future_batch = future_x0.to(device_id)
-                        known_batch = future_known_c.to(device_id)
-                        
-                        B = hist_batch.shape[0]
-                        K = cfg.ENSEMBLE_K
+                if is_nan_local.item() > 0.5:
+                    nan_detected_in_epoch = True
+                    break 
 
-                        # 扩展 Batch 以适配 Ensemble
-                        hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
-                        stat_exp = stat_batch.repeat_interleave(K, dim=0)
-                        future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                        known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                        
-                        # 生成噪声
-                        noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
-                        t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
-                        t_exp = t_per_sample.repeat_interleave(K) 
-
-                        # 获取加噪参数 (保留在 AMP 上下文中，可能得到 fp16 或 fp32)
-                        if dist.is_initialized():
-                            sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                            sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        else:
-                            sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                            sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        
-                        x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
-                        x_t.requires_grad_(True)
-
-                        # 模型预测
-                        predicted_noise = ddp_model(
-                            x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
-                        )
-
-                    # 2. Loss 计算 - 强制使用 Float32
-                    # 禁用 autocast，确保中间变量有足够的动态范围 (10^38) 防止溢出
-                    with amp.autocast(enabled=False):
-                        # [Critical] 将所有参与 Loss 计算的变量转为 Float32
-                        predicted_noise_fp32 = predicted_noise.float()
-                        x_t_fp32 = x_t.float()
-                        
-                        # 重新获取 FP32 格式的调度参数 (确保运算时不降级)
-                        if dist.is_initialized():
-                            sqrt_alpha_bar_fp32 = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                            alphas_cumprod_fp32 = ddp_model.module.alphas_cumprod.float()
-                        else:
-                            sqrt_alpha_bar_fp32 = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                            alphas_cumprod_fp32 = ddp_model.alphas_cumprod.float()
-
-                        if torch.isnan(predicted_noise_fp32).any() or torch.isinf(predicted_noise_fp32).any():
-                            print(f"[FATAL] Model output contains NaN/Inf! Inputs or Layers unstable.")
-                        
-                        # 3. 在 Float32 空间下重建 x0
-                        # 此时即使分母很小，FP32 也能容纳结果，不会溢出为 Inf
-                        pred_x0_exp = (x_t_fp32 - sqrt_one_minus_alpha_bar_fp32 * predicted_noise_fp32) / (sqrt_alpha_bar_fp32 + 1e-8)
-                        
-                        # Reshape 
-                        pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                        target_x0 = future_batch.permute(0, 2, 1, 3).float() # Ensure Target is FP32
-                        target_x0_expanded = target_x0.unsqueeze(1) 
-                        
-                        # 获取权重 (FP32)
-                        weights = alphas_cumprod_fp32[t_exp].view(B, K, 1, 1, 1)
-                        weights = weights[:, 0:1, :, :, :] 
-
-                        # --- 计算 Loss (全部在 FP32 下进行) ---
-                        ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
-                        ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
-                        ensemble_var = torch.clamp(ensemble_var, min=1e-4)
-
-                        # Mean MSE
-                        loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
-
-                        # Energy Score
-                        eps_safe = 1e-8
-                        diff = pred_x0_grouped - target_x0_expanded
-                        sum_sq = diff.pow(2).sum(dim=-1) 
-                        es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
-                        
-                        diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
-                        sum_sq_div = diff_div.pow(2).sum(dim=-1)
-                        es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
-                        
-                        es_combined = es_accuracy - 0.5 * es_diversity
-                        loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
-
-                        # NLL
-                        sq_error = (target_x0_expanded - ensemble_mean)**2
-                        nll_term1 = 0.5 * torch.log(ensemble_var)
-                        nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
-                        nll_per_element = nll_term1 + nll_term2
-                        nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
-                        loss_nll = (nll_per_element_clamped * weights).mean()
-
-                        # Total Loss
-                        loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
-                               cfg.ENERGY_LAMBDA * loss_energy + \
-                               cfg.NLL_LAMBDA * loss_nll
-                        
-                        loss = loss / cfg.ACCUMULATION_STEPS
-
-                        # --- [New] Resilient NaN Check & DDP Sync ---
-                        is_nan_local = torch.tensor(0.0, device=device_id)
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            is_nan_local = torch.tensor(1.0, device=device_id)
-                            print(f"[Rank {rank}] NaN detected at Batch {i}!")
-
-                        # DDP All-Reduce: 只要任何一个 Rank 发现 NaN (MAX > 0)，所有 Rank 都将感知
-                        if dist.is_initialized():
-                            dist.all_reduce(is_nan_local, op=dist.ReduceOp.MAX)
-                        
-                        if is_nan_local.item() > 0.5:
-                            nan_detected_in_epoch = True
-                            if rank == 0:
-                                print(f"[Alert] NaN detected globally at Epoch {epoch+1}, Batch {i}. Initiating rollback...")
-                            break # 跳出 Batch 循环
-
-                    # Backward (Scaler 会自动处理 FP32 loss)
-                    scaler.scale(loss).backward()
-                    batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
-
-                if is_grad_update_step:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    avg_loss_step = batch_loss_tracker
-                    total_train_loss += avg_loss_step 
-                    batch_loss_tracker = 0.0 
-                    if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
-                else:
-                    pass
-            
-            # --- Batch 循环结束或中断后 ---
             if nan_detected_in_epoch:
-                # 执行回滚逻辑
                 retry_count += 1
-                
-                # 恢复状态
-                if rank == 0: print("Restoring model/optimizer/scheduler/scaler state...")
+                if rank == 0: print("Restoring state...")
                 ddp_model.load_state_dict(snapshot['model'])
                 optimizer.load_state_dict(snapshot['optimizer'])
                 scheduler.load_state_dict(snapshot['scheduler'])
                 scaler.load_state_dict(snapshot['scaler'])
-                
-                # 清理
                 optimizer.zero_grad()
                 torch.cuda.empty_cache()
-                
-                # Continue while 循环 -> 重新开始 Epoch
                 continue
             else:
-                # 成功完成当前 Epoch
                 epoch_success = True
 
-        # --- 如果 Epoch 成功，进入验证环节 ---
-        
-        # --- 验证循环 ---
+        # Validation Logic (Unchanged)
         ddp_model.eval()
         total_val_loss = 0
-        
         with torch.no_grad():
             for tensors in val_dataloader:
                 history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
@@ -452,29 +483,22 @@ def train():
                     future_x0 = future_x0.permute(0, 2, 1, 3)
                     history_c = history_c.permute(0, 2, 1, 3)
                     future_known_c = future_known_c.permute(0, 2, 1, 3)
-                    
                     b = future_x0.shape[0]
                     noise = torch.randn_like(future_x0) 
-                    
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
-                    
                     if dist.is_initialized():
                         sqrt_alpha = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
                         sqrt_one_minus = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
                     else:
                         sqrt_alpha = ddp_model.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
                         sqrt_one_minus = ddp_model.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
-
                     x_k = sqrt_alpha * future_x0 + sqrt_one_minus * noise
-                    
                     pred_noise = ddp_model(x_k, k, history_c, static_c, future_known_c, adj_tensor)
                     val_loss = nn.MSELoss()(pred_noise, noise)
                     total_val_loss += val_loss.item()
 
-        # --- Loss 聚合与日志 ---
         num_updates = len(train_dataloader) / cfg.ACCUMULATION_STEPS
         avg_train_loss_local = total_train_loss / max(num_updates, 1)
-        
         avg_train_loss_tensor = torch.tensor(avg_train_loss_local).to(device_id)
         if dist.is_initialized():
             dist.all_reduce(avg_train_loss_tensor, op=dist.ReduceOp.SUM)
@@ -506,7 +530,6 @@ def train():
                 if best_model_path_for_val is not None and os.path.exists(best_model_path_for_val):
                     os.rename(best_model_path_for_val, model_save_path_second_best)
                     second_best_model_path_for_val = model_save_path_second_best
-                
                 state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
                 torch.save(state_dict, model_save_path_best)
                 best_model_path_for_val = model_save_path_best
@@ -516,12 +539,9 @@ def train():
                 torch.save(state_dict, model_save_path_second_best)
                 second_best_model_path_for_val = model_save_path_second_best
 
-        # --- 周期性 MAE 评估 ---
         run_mae_eval = cfg.EVAL_ON_VAL and (epoch + 1) % cfg.EVAL_ON_VAL_EPOCH == 0
         if run_mae_eval:
-            current_val_mae = float('inf') 
             if rank == 0: print(f"Epoch {epoch+1}, running periodic MAE evaluation...")
-            
             model_to_eval = ddp_model.module if dist.is_initialized() else ddp_model
             current_val_seq_local = periodic_evaluate_mae(
                 model_to_eval, 
@@ -531,7 +551,6 @@ def train():
                 cfg,
                 device_id
             )
-        
             if dist.is_initialized():
                 gathered_results = [None] * world_size
                 dist.gather_object(
@@ -548,9 +567,7 @@ def train():
                 current_val_mae = np.mean(np.abs(current_val_seq - y_true_original))
                 epoch_log_data['avg_val_mae'] = current_val_mae
                 print(f"Avg Val MAE: {current_val_mae:.4f}")
-
                 state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
-                
                 if current_val_mae < best_val_mae:
                     second_best_val_mae = best_val_mae
                     best_val_mae = current_val_mae
@@ -568,36 +585,12 @@ def train():
 
         if rank == 0:
             csv_logger.log_epoch(epoch_log_data)
-
         if dist.is_initialized():
             dist.barrier()
         scheduler.step()
 
     if dist.is_initialized():
         dist.barrier()
-    
-    if rank == 0:
-        print("\n" + "="*50 + "\nTraining finished. Starting evaluation on the test set...\n" + "="*50 + "\n")
-    
-    path_list_to_eval = [best_model_path_for_eval, second_best_model_path_for_eval, best_model_path_for_val, second_best_model_path_for_val] if rank == 0 else [None, None, None, None]
-    
-    if dist.is_initialized():
-        dist.broadcast_object_list(path_list_to_eval, src=0)
-    
-    best_model_path_synced, second_best_model_path_synced, best_model_path_for_val_synced, second_best_model_path_for_val_synced = path_list_to_eval
-
-    def run_eval(path, key_name, desc):
-        if path and os.path.exists(path):
-            if rank == 0: print(f"\n[ALL GPUS] Evaluating {desc}: {os.path.basename(path)}")
-            metrics = evaluate_model(cfg, path, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path, device=f"cuda:{device_id}", rank=rank, world_size=world_size, key=key_name)
-            if rank == 0: print_metrics(metrics)
-
-    run_eval(best_model_path_for_val_synced, 'best_val', 'BEST VAL model')
-    run_eval(second_best_model_path_for_val_synced, 'second_best_val', '2ND BEST VAL model')
-    run_eval(best_model_path_synced, 'best', 'BEST MAE model')
-    run_eval(second_best_model_path_synced, 'second_best', '2ND BEST MAE model')
-
-    if dist.is_initialized():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
