@@ -309,148 +309,143 @@ def train():
                 
                 try:
                     with context:
-                        with amp.autocast():
-                            hist_batch = history_c.to(device_id)
-                            stat_batch = static_c.to(device_id)
-                            future_batch = future_x0.to(device_id)
-                            known_batch = future_known_c.to(device_id)
+                        hist_batch = history_c.to(device_id)
+                        stat_batch = static_c.to(device_id)
+                        future_batch = future_x0.to(device_id)
+                        known_batch = future_known_c.to(device_id)
+                        
+                        B = hist_batch.shape[0]
+                        K = cfg.ENSEMBLE_K
+
+                        hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                        stat_exp = stat_batch.repeat_interleave(K, dim=0)
+                        future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                        
+                        noise = torch.randn_like(future_exp)
+                        t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
+                        t_exp = t_per_sample.repeat_interleave(K) 
+
+                        if dist.is_initialized():
+                            sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                        else:
+                            sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                            sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                        
+                        x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
+                        x_t.requires_grad_(True)
+
+                        # Forward (NanMonitor 会在这里工作)
+                        predicted_noise = ddp_model(
+                            x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
+                        )
+
+                        predicted_noise_fp32 = predicted_noise.float()
+                        x_t_fp32 = x_t.float()
+                        
+                        if dist.is_initialized():
+                            sqrt_alpha_bar_fp32 = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            alphas_cumprod_fp32 = ddp_model.module.alphas_cumprod.float()
+                        else:
+                            sqrt_alpha_bar_fp32 = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            alphas_cumprod_fp32 = ddp_model.alphas_cumprod.float()
+
+                        pred_x0_exp = (x_t_fp32 - sqrt_one_minus_alpha_bar_fp32 * predicted_noise_fp32) / (sqrt_alpha_bar_fp32 + 1e-8)
+                        pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                        target_x0 = future_batch.permute(0, 2, 1, 3).float()
+                        target_x0_expanded = target_x0.unsqueeze(1) 
+                        
+                        weights = alphas_cumprod_fp32[t_exp].view(B, K, 1, 1, 1)
+                        weights = weights[:, 0:1, :, :, :] 
+
+                        ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                        ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                        ensemble_var = torch.clamp(ensemble_var, min=1e-4)
+
+                        loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
+
+                        # --- Energy Score Calculation with Off-Diagonal Mask ---
+                        eps_safe = 1e-3
+                        diff = pred_x0_grouped - target_x0_expanded
+                        sum_sq = diff.pow(2).sum(dim=-1) 
+                        es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
+                        
+                        diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                        sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                        
+                        # [MODIFICATION] Mask out diagonal elements
+                        K_ens = sum_sq_div.shape[1]
+                        eye_mask = torch.eye(K_ens, device=device_id).bool()
+                        off_diag_mask = ~eye_mask # 取反，只保留非对角线
+                        
+                        # --- [DEBUG TOOL 2] 多样性数值探针 (Updated) ---
+                        # 只检查非对角线元素（真正有意义的多样性）
+                        masked_sum_sq_div = sum_sq_div[:, off_diag_mask]
+
+                        print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
+                        
+                        if masked_sum_sq_div.numel() > 0: # 确保 K > 1
+                            min_div_val = masked_sum_sq_div.min().item()
+                            if min_div_val < 1e-9:
+                                print(f"\n[DEBUG-ENERGY] Batch {i}: Off-diagonal diversity term is extremely small: {min_div_val:.4e}")
+                                print("[ALERT] Mode Collapse Detected! Different ensemble members are predicting identical values.")
+
+                            # 计算 Diversity Score (只对非对角线取均值)
+                            # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
+                            es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
+                        else:
+                            es_diversity = torch.tensor(0.0, device=device_id)
+
+                        es_combined = es_accuracy - 0.5 * es_diversity
+                        loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
+
+                        sq_error = (target_x0_expanded - ensemble_mean)**2
+                        nll_term1 = 0.5 * torch.log(ensemble_var)
+                        nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
+                        nll_per_element = nll_term1 + nll_term2
+                        nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
+                        loss_nll = (nll_per_element_clamped * weights).mean()
+
+                        print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
+
+                        loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
+                                cfg.ENERGY_LAMBDA * loss_energy + \
+                                cfg.NLL_LAMBDA * loss_nll
+                        
+                        loss = loss / cfg.ACCUMULATION_STEPS
+
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"[Rank {rank}] Loss became NaN at Batch {i} (FP32 calculation).")
+                            nan_detected_in_epoch = True
+
+                    if not nan_detected_in_epoch:
+                        loss.backward()
+                        batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
+                        
+                        # --- [DEBUG TOOL 3] 梯度监理 (Gradient Supervisor) ---
+                        if is_grad_update_step:
+                            has_nan_grad = False
+                            for name, param in ddp_model.named_parameters():
+                                if param.grad is not None:
+                                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                        print(f"\n[DEBUG-GRAD] Parameter '{name}' has NaN/Inf gradient!")
+                                        has_nan_grad = True
+                                    
+                                    grad_norm = param.grad.norm().item()
+                                    if grad_norm > 100.0:
+                                        print(f"[DEBUG-GRAD] Parameter '{name}' has large grad norm: {grad_norm:.4f}")
                             
-                            B = hist_batch.shape[0]
-                            K = cfg.ENSEMBLE_K
-
-                            hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
-                            stat_exp = stat_batch.repeat_interleave(K, dim=0)
-                            future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                            known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                            
-                            noise = torch.randn_like(future_exp)
-                            t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
-                            t_exp = t_per_sample.repeat_interleave(K) 
-
-                            if dist.is_initialized():
-                                sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                                sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                            else:
-                                sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                                sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                            
-                            x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
-                            x_t.requires_grad_(True)
-
-                            # Forward (NanMonitor 会在这里工作)
-                            predicted_noise = ddp_model(
-                                x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
-                            )
-
-                        # Loss 计算 (Float32)
-                        with amp.autocast(enabled=False):
-                            predicted_noise_fp32 = predicted_noise.float()
-                            x_t_fp32 = x_t.float()
-                            
-                            if dist.is_initialized():
-                                sqrt_alpha_bar_fp32 = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                                sqrt_one_minus_alpha_bar_fp32 = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                                alphas_cumprod_fp32 = ddp_model.module.alphas_cumprod.float()
-                            else:
-                                sqrt_alpha_bar_fp32 = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                                sqrt_one_minus_alpha_bar_fp32 = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
-                                alphas_cumprod_fp32 = ddp_model.alphas_cumprod.float()
-
-                            pred_x0_exp = (x_t_fp32 - sqrt_one_minus_alpha_bar_fp32 * predicted_noise_fp32) / (sqrt_alpha_bar_fp32 + 1e-8)
-                            pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                            target_x0 = future_batch.permute(0, 2, 1, 3).float()
-                            target_x0_expanded = target_x0.unsqueeze(1) 
-                            
-                            weights = alphas_cumprod_fp32[t_exp].view(B, K, 1, 1, 1)
-                            weights = weights[:, 0:1, :, :, :] 
-
-                            ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
-                            ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
-                            ensemble_var = torch.clamp(ensemble_var, min=1e-4)
-
-                            loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
-
-                            # --- Energy Score Calculation with Off-Diagonal Mask ---
-                            eps_safe = 1e-3
-                            diff = pred_x0_grouped - target_x0_expanded
-                            sum_sq = diff.pow(2).sum(dim=-1) 
-                            es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
-                            
-                            diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
-                            sum_sq_div = diff_div.pow(2).sum(dim=-1)
-                            
-                            # [MODIFICATION] Mask out diagonal elements
-                            K_ens = sum_sq_div.shape[1]
-                            eye_mask = torch.eye(K_ens, device=device_id).bool()
-                            off_diag_mask = ~eye_mask # 取反，只保留非对角线
-                            
-                            # --- [DEBUG TOOL 2] 多样性数值探针 (Updated) ---
-                            # 只检查非对角线元素（真正有意义的多样性）
-                            masked_sum_sq_div = sum_sq_div[:, off_diag_mask]
-
-                            print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
-                            
-                            if masked_sum_sq_div.numel() > 0: # 确保 K > 1
-                                min_div_val = masked_sum_sq_div.min().item()
-                                if min_div_val < 1e-9:
-                                    print(f"\n[DEBUG-ENERGY] Batch {i}: Off-diagonal diversity term is extremely small: {min_div_val:.4e}")
-                                    print("[ALERT] Mode Collapse Detected! Different ensemble members are predicting identical values.")
-
-                                # 计算 Diversity Score (只对非对角线取均值)
-                                # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
-                                es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
-                            else:
-                                es_diversity = torch.tensor(0.0, device=device_id)
-
-                            es_combined = es_accuracy - 0.5 * es_diversity
-                            loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
-
-                            sq_error = (target_x0_expanded - ensemble_mean)**2
-                            nll_term1 = 0.5 * torch.log(ensemble_var)
-                            nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
-                            nll_per_element = nll_term1 + nll_term2
-                            nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
-                            loss_nll = (nll_per_element_clamped * weights).mean()
-
-                            print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
-
-                            loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
-                                   cfg.ENERGY_LAMBDA * loss_energy + \
-                                   cfg.NLL_LAMBDA * loss_nll
-                            
-                            loss = loss / cfg.ACCUMULATION_STEPS
-
-                            if torch.isnan(loss) or torch.isinf(loss):
-                                print(f"[Rank {rank}] Loss became NaN at Batch {i} (FP32 calculation).")
+                            if has_nan_grad:
+                                print(f"[DEBUG-GRAD] Batch {i}: Gradient explosion detected. Stopping batch.")
                                 nan_detected_in_epoch = True
-
-                        if not nan_detected_in_epoch:
-                            scaler.scale(loss).backward()
-                            batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
-                            
-                            # --- [DEBUG TOOL 3] 梯度监理 (Gradient Supervisor) ---
-                            if is_grad_update_step:
-                                scaler.unscale_(optimizer) # 先 unscale 以查看真实梯度值
-                                has_nan_grad = False
-                                for name, param in ddp_model.named_parameters():
-                                    if param.grad is not None:
-                                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                            print(f"\n[DEBUG-GRAD] Parameter '{name}' has NaN/Inf gradient!")
-                                            has_nan_grad = True
-                                        
-                                        grad_norm = param.grad.norm().item()
-                                        if grad_norm > 100.0:
-                                            print(f"[DEBUG-GRAD] Parameter '{name}' has large grad norm: {grad_norm:.4f}")
-                                
-                                if has_nan_grad:
-                                    print(f"[DEBUG-GRAD] Batch {i}: Gradient explosion detected. Stopping batch.")
-                                    nan_detected_in_epoch = True
-                                    optimizer.zero_grad() 
+                                optimizer.zero_grad() 
 
                     if is_grad_update_step and not nan_detected_in_epoch:
                         torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        optimizer.step()
                         optimizer.zero_grad()
                         avg_loss_step = batch_loss_tracker
                         total_train_loss += avg_loss_step 
