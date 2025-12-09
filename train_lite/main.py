@@ -120,7 +120,7 @@ def train():
         cfg.RUN_ID = run_id
         print(f"Starting Training (Debug Mode). Run ID: {cfg.RUN_ID}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
-        print(f"Strategies: Energy Loss + Resilient Rollback + Float32 Loss + Gradient Supervision")
+        print(f"Strategies: Energy Loss (Masked Diag) + Resilient Rollback + Float32 Loss + Gradient Supervision")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
@@ -370,28 +370,38 @@ def train():
 
                             loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
-                            # --- Energy Score Calculation with Probe ---
+                            # --- Energy Score Calculation with Off-Diagonal Mask ---
                             eps_safe = 1e-8
                             diff = pred_x0_grouped - target_x0_expanded
                             sum_sq = diff.pow(2).sum(dim=-1) 
-                            print(f"[tgt] min:{target_x0.min().item():.2e} \t max:{target_x0.max().item():.2e} \t mean:{target_x0.mean().item():.2e} \t median:{target_x0.median().item():.2e}")
-                            print(f"[acc] min:{sum_sq.min().item():.2e} \t max:{sum_sq.max().item():.2e} \t mean:{sum_sq.mean().item():.2e} \t median:{sum_sq.median().item():.2e}")
-
                             es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
                             
                             diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
                             sum_sq_div = diff_div.pow(2).sum(dim=-1)
-
-                            print(f"[div] min:{sum_sq_div.min().item():.2e} \t max:{sum_sq_div.max().item():.2e} \t mean:{sum_sq_div.mean().item():.2e} \t median:{sum_sq_div.median().item():.2e}")
-                            exit()
-                            # --- [DEBUG TOOL 2] 多样性数值探针 ---
-                            min_div_val = sum_sq_div.min().item()
-                            if min_div_val < 1e-9:
-                                print(f"\n[DEBUG-ENERGY] Batch {i}: Diversity term (sum_sq) is extremely small: {min_div_val:.4e}")
-                                print("This will likely cause Infinite Gradients in backward pass!")
-
-                            es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
                             
+                            # [MODIFICATION] Mask out diagonal elements
+                            K_ens = sum_sq_div.shape[1]
+                            eye_mask = torch.eye(K_ens, device=device_id).bool()
+                            off_diag_mask = ~eye_mask # 取反，只保留非对角线
+                            
+                            # --- [DEBUG TOOL 2] 多样性数值探针 (Updated) ---
+                            # 只检查非对角线元素（真正有意义的多样性）
+                            masked_sum_sq_div = sum_sq_div[:, off_diag_mask]
+
+                            print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
+                            
+                            if masked_sum_sq_div.numel() > 0: # 确保 K > 1
+                                min_div_val = masked_sum_sq_div.min().item()
+                                if min_div_val < 1e-9:
+                                    print(f"\n[DEBUG-ENERGY] Batch {i}: Off-diagonal diversity term is extremely small: {min_div_val:.4e}")
+                                    print("[ALERT] Mode Collapse Detected! Different ensemble members are predicting identical values.")
+
+                                # 计算 Diversity Score (只对非对角线取均值)
+                                # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
+                                es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
+                            else:
+                                es_diversity = torch.tensor(0.0, device=device_id)
+
                             es_combined = es_accuracy - 0.5 * es_diversity
                             loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
@@ -401,6 +411,8 @@ def train():
                             nll_per_element = nll_term1 + nll_term2
                             nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
                             loss_nll = (nll_per_element_clamped * weights).mean()
+
+                            print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
 
                             loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                                    cfg.ENERGY_LAMBDA * loss_energy + \
@@ -417,8 +429,6 @@ def train():
                             batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
                             
                             # --- [DEBUG TOOL 3] 梯度监理 (Gradient Supervisor) ---
-                            # 在 unscale 之前或之后检查皆可，这里我们为了安全，先检查是否有 Nan
-                            # 注意：Scaler 可能会在 step 时处理 NaN，但我们要看到底是谁产生的
                             if is_grad_update_step:
                                 scaler.unscale_(optimizer) # 先 unscale 以查看真实梯度值
                                 has_nan_grad = False
@@ -428,7 +438,6 @@ def train():
                                             print(f"\n[DEBUG-GRAD] Parameter '{name}' has NaN/Inf gradient!")
                                             has_nan_grad = True
                                         
-                                        # 可选：打印梯度 Norm 过大的情况
                                         grad_norm = param.grad.norm().item()
                                         if grad_norm > 100.0:
                                             print(f"[DEBUG-GRAD] Parameter '{name}' has large grad norm: {grad_norm:.4f}")
@@ -436,7 +445,6 @@ def train():
                                 if has_nan_grad:
                                     print(f"[DEBUG-GRAD] Batch {i}: Gradient explosion detected. Stopping batch.")
                                     nan_detected_in_epoch = True
-                                    # 不要 step，直接触发回滚
                                     optimizer.zero_grad() 
 
                     if is_grad_update_step and not nan_detected_in_epoch:
@@ -576,7 +584,7 @@ def train():
                 if current_val_mae < best_val_mae:
                     second_best_val_mae = best_val_mae
                     best_val_mae = current_val_mae
-                    if best_model_path_for_eval is not None and os.path.exists(best_model_path_for_eval):
+                    if best_model_path_for_val is not None and os.path.exists(best_model_path_for_eval):
                         if os.path.exists(model_save_path_mae_second_best):
                             os.remove(model_save_path_mae_second_best)
                         os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
