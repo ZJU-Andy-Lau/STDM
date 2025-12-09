@@ -72,6 +72,7 @@ def train():
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
         print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA})")
         print(f"Resilient Strategy: Rollback on NaN enabled.")
+        print(f"Precision Strategy: AMP for Forward, Float32 for Loss.")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
@@ -213,7 +214,7 @@ def train():
 
     # --- 训练循环 (含回滚机制) ---
     max_retries = 10
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(cfg.EPOCHS):
         # [Checkpoint] 在 Epoch 开始前，保存当前状态到内存
@@ -221,8 +222,6 @@ def train():
             print(f"Creating snapshot for Epoch {epoch+1}...")
         
         # 使用 copy.deepcopy 保存状态字典到 CPU 内存
-        # 注意: state_dict 里面的 tensor 默认在 GPU 上，如果显存紧张，可以考虑 .cpu() 但会增加 I/O
-        # 这里为了速度，我们直接 deepcopy。如果 OOM，可以改为 {k: v.cpu() for k, v in ...}
         snapshot = {
             'model': copy.deepcopy(ddp_model.state_dict()),
             'optimizer': copy.deepcopy(optimizer.state_dict()),
@@ -278,8 +277,9 @@ def train():
                         context = nullcontext()
                 
                 with context:
+                    # 1. 前向传播 (Forward) - 保持在 AMP 混合精度下运行
                     with amp.autocast():
-                        # 1. 数据上 GPU 
+                        # 数据上 GPU 
                         hist_batch = history_c.to(device_id)
                         stat_batch = static_c.to(device_id)
                         future_batch = future_x0.to(device_id)
@@ -288,17 +288,18 @@ def train():
                         B = hist_batch.shape[0]
                         K = cfg.ENSEMBLE_K
 
-                        # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
+                        # 扩展 Batch 以适配 Ensemble
                         hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
                         stat_exp = stat_batch.repeat_interleave(K, dim=0)
                         future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
                         known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
                         
-                        # 3. 扩散过程
+                        # 生成噪声
                         noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
                         t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
                         t_exp = t_per_sample.repeat_interleave(K) 
 
+                        # 获取加噪参数 (保留在 AMP 上下文中，可能得到 fp16 或 fp32)
                         if dist.is_initialized():
                             sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
                             sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
@@ -309,34 +310,53 @@ def train():
                         x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
                         x_t.requires_grad_(True)
 
-                        # 4. 模型预测
+                        # 模型预测
                         predicted_noise = ddp_model(
                             x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
                         )
 
-                        if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
+                    # 2. Loss 计算 - 强制使用 Float32
+                    # 禁用 autocast，确保中间变量有足够的动态范围 (10^38) 防止溢出
+                    with amp.autocast(enabled=False):
+                        # [Critical] 将所有参与 Loss 计算的变量转为 Float32
+                        predicted_noise_fp32 = predicted_noise.float()
+                        x_t_fp32 = x_t.float()
+                        
+                        # 重新获取 FP32 格式的调度参数 (确保运算时不降级)
+                        if dist.is_initialized():
+                            sqrt_alpha_bar_fp32 = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            alphas_cumprod_fp32 = ddp_model.module.alphas_cumprod.float()
+                        else:
+                            sqrt_alpha_bar_fp32 = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            sqrt_one_minus_alpha_bar_fp32 = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1).float()
+                            alphas_cumprod_fp32 = ddp_model.alphas_cumprod.float()
+
+                        if torch.isnan(predicted_noise_fp32).any() or torch.isinf(predicted_noise_fp32).any():
                             print(f"[FATAL] Model output contains NaN/Inf! Inputs or Layers unstable.")
                         
-                        # 5. Loss 计算
-                        pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                        # 3. 在 Float32 空间下重建 x0
+                        # 此时即使分母很小，FP32 也能容纳结果，不会溢出为 Inf
+                        pred_x0_exp = (x_t_fp32 - sqrt_one_minus_alpha_bar_fp32 * predicted_noise_fp32) / (sqrt_alpha_bar_fp32 + 1e-8)
+                        
+                        # Reshape 
                         pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                        target_x0 = future_batch.permute(0, 2, 1, 3) 
+                        target_x0 = future_batch.permute(0, 2, 1, 3).float() # Ensure Target is FP32
                         target_x0_expanded = target_x0.unsqueeze(1) 
                         
-                        if dist.is_initialized():
-                            alphas_cumprod = ddp_model.module.alphas_cumprod
-                        else:
-                            alphas_cumprod = ddp_model.alphas_cumprod
-                            
-                        weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
+                        # 获取权重 (FP32)
+                        weights = alphas_cumprod_fp32[t_exp].view(B, K, 1, 1, 1)
                         weights = weights[:, 0:1, :, :, :] 
 
+                        # --- 计算 Loss (全部在 FP32 下进行) ---
                         ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
                         ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
                         ensemble_var = torch.clamp(ensemble_var, min=1e-4)
 
+                        # Mean MSE
                         loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
+                        # Energy Score
                         eps_safe = 1e-8
                         diff = pred_x0_grouped - target_x0_expanded
                         sum_sq = diff.pow(2).sum(dim=-1) 
@@ -349,6 +369,7 @@ def train():
                         es_combined = es_accuracy - 0.5 * es_diversity
                         loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
+                        # NLL
                         sq_error = (target_x0_expanded - ensemble_mean)**2
                         nll_term1 = 0.5 * torch.log(ensemble_var)
                         nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
@@ -356,6 +377,7 @@ def train():
                         nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
                         loss_nll = (nll_per_element_clamped * weights).mean()
 
+                        # Total Loss
                         loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                                cfg.ENERGY_LAMBDA * loss_energy + \
                                cfg.NLL_LAMBDA * loss_nll
@@ -366,7 +388,6 @@ def train():
                         is_nan_local = torch.tensor(0.0, device=device_id)
                         if torch.isnan(loss) or torch.isinf(loss):
                             is_nan_local = torch.tensor(1.0, device=device_id)
-                            # 可以在这里打印本地 Log
                             print(f"[Rank {rank}] NaN detected at Batch {i}!")
 
                         # DDP All-Reduce: 只要任何一个 Rank 发现 NaN (MAX > 0)，所有 Rank 都将感知
@@ -377,10 +398,9 @@ def train():
                             nan_detected_in_epoch = True
                             if rank == 0:
                                 print(f"[Alert] NaN detected globally at Epoch {epoch+1}, Batch {i}. Initiating rollback...")
-                                # 可以调用 debugger 打印详细信息（可选）
-                                # debugger.diagnose_loss_detail(pred_x0_grouped, target_x0_expanded, weights)
                             break # 跳出 Batch 循环
 
+                    # Backward (Scaler 会自动处理 FP32 loss)
                     scaler.scale(loss).backward()
                     batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
 
