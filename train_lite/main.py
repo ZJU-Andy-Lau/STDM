@@ -371,7 +371,7 @@ def train():
                             loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
                             # --- Energy Score Calculation with Off-Diagonal Mask ---
-                            eps_safe = 1e-8
+                            eps_safe = 1e-3
                             diff = pred_x0_grouped - target_x0_expanded
                             sum_sq = diff.pow(2).sum(dim=-1) 
                             es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
