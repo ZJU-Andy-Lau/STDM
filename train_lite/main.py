@@ -31,13 +31,13 @@ from torch.utils.data.distributed import DistributedSampler
 
 try:
     from train_lite.config import ConfigV2
-    from train_lite.utils import CsvLogger, NanDebugger
+    from train_lite.utils import CsvLogger, calc_layer_lengths
     from train_lite.dataset import EVChargerDatasetV2, create_sliding_windows
     from train_lite.metrics import print_metrics
     from train_lite.evaluation import periodic_evaluate_mae, evaluate_model
 except ImportError:
     from config import ConfigV2
-    from utils import CsvLogger, NanDebugger
+    from utils import CsvLogger, calc_layer_lengths
     from dataset import EVChargerDatasetV2, create_sliding_windows
     from metrics import print_metrics
     from evaluation import periodic_evaluate_mae, evaluate_model
@@ -207,8 +207,6 @@ def train():
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
 
-    debugger = NanDebugger(ddp_model, logger=print if rank == 0 else lambda x: None)
-
     # --- 训练循环 ---
     for epoch in range(cfg.EPOCHS):
         if dist.is_initialized():
@@ -234,115 +232,136 @@ def train():
                     context = nullcontext()
             
             with context:
-                with amp.autocast():
-                    # 1. 数据上 GPU 
-                    hist_batch = history_c.to(device_id)
-                    stat_batch = static_c.to(device_id)
-                    future_batch = future_x0.to(device_id)
-                    known_batch = future_known_c.to(device_id)
-                    
-                    B = hist_batch.shape[0]
-                    K = cfg.ENSEMBLE_K
+                # with amp.autocast():
+                # 1. 数据上 GPU 
+                hist_batch = history_c.to(device_id)
+                stat_batch = static_c.to(device_id)
+                future_batch = future_x0.to(device_id)
+                known_batch = future_known_c.to(device_id)
+                
+                B = hist_batch.shape[0]
+                K = cfg.ENSEMBLE_K
 
-                    # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
-                    # (B, L, N, C) -> (B*K, N, L, C)
-                    hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
-                    
-                    # Static: (B, N, F) -> (B*K, N, F) 
-                    stat_exp = stat_batch.repeat_interleave(K, dim=0)
-                    
-                    # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
-                    future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                    known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
-                    
-                    # 3. 扩散过程
-                    noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
-                    
-                    # 生成时间步 t
-                    t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
-                    t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
+                # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
+                # (B, L, N, C) -> (B*K, N, L, C)
+                hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                
+                # Static: (B, N, F) -> (B*K, N, F) 
+                stat_exp = stat_batch.repeat_interleave(K, dim=0)
+                
+                # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
+                future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                
+                # 3. 扩散过程
+                noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
+                
+                # 生成时间步 t
+                t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
+                t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
 
-                    # 获取 alpha_bar
-                    if dist.is_initialized():
-                        sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                    else:
-                        sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                        sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
-                    
-                    x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
-                    x_t.requires_grad_(True)
+                # 获取 alpha_bar
+                if dist.is_initialized():
+                    sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                    sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                else:
+                    sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                    sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                
+                x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
+                x_t.requires_grad_(True)
 
-                    # 4. 模型预测
-                    predicted_noise = ddp_model(
-                        x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
-                    )
+                # 4. 模型预测
+                predicted_noise = ddp_model(
+                    x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
+                )
+                
+                # 5. Loss 计算 (New Strategy: Energy + MeanMSE + NLL)
+                pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                
+                # Reshape 以分组: (B, K, N, L, C)
+                pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                
+                # Target 准备: (B, 1, N, L, C)
+                target_x0 = future_batch.permute(0, 2, 1, 3) 
+                target_x0_expanded = target_x0.unsqueeze(1) 
+                
+                # Weights: (B, 1, 1, 1, 1)
+                if dist.is_initialized():
+                    alphas_cumprod = ddp_model.module.alphas_cumprod
+                else:
+                    alphas_cumprod = ddp_model.alphas_cumprod
                     
-                    # 5. Loss 计算 (New Strategy: Energy + MeanMSE + NLL)
-                    pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
-                    
-                    # Reshape 以分组: (B, K, N, L, C)
-                    pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
-                    
-                    # Target 准备: (B, 1, N, L, C)
-                    target_x0 = future_batch.permute(0, 2, 1, 3) 
-                    target_x0_expanded = target_x0.unsqueeze(1) 
-                    
-                    # Weights: (B, 1, 1, 1, 1)
-                    if dist.is_initialized():
-                        alphas_cumprod = ddp_model.module.alphas_cumprod
-                    else:
-                        alphas_cumprod = ddp_model.alphas_cumprod
-                        
-                    weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
-                    weights = weights[:, 0:1, :, :, :] 
+                weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
+                weights = weights[:, 0:1, :, :, :] 
 
-                    # --- [Part 1] 统计量计算 ---
-                    # 均值 (B, 1, N, L, C)
-                    ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
-                    ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
-                    ensemble_var = torch.clamp(ensemble_var, min=1e-4)
+                # --- [Part 1] 统计量计算 ---
+                # 均值 (B, 1, N, L, C)
+                ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                # 方差 (B, 1, N, L, C), 使用 clamp 避免除零，1e-6 确保数值稳定
+                ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                ensemble_var = torch.clamp(ensemble_var, min=1e-4)
 
-                    loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
+                # --- [Part 2] Mean MSE Loss (定海神针) ---
+                # 确保分布的中心对齐真值，防止漂移
+                loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
-                    eps_safe = 1e-6
-                    diff = pred_x0_grouped - target_x0_expanded
-                    sum_sq = diff.pow(2).sum(dim=-1) 
-                    es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
-                    
-                    diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
-                    sum_sq_div = diff_div.pow(2).sum(dim=-1)
-                    es_diversity = torch.sqrt(sum_sq_div + eps_safe).mean(dim=(1, 2))
-                    
-                    es_combined = es_accuracy - 0.5 * es_diversity
-                    loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
+                # --- [Part 3] Energy Loss (CRPS 推广 - 总指挥) ---
+                # Energy Score = E||X-y|| - 0.5 * E||X-X'||
+                
+                # 3.1 准确性项 (Accuracy): ||X - y||
+                eps_safe = 1e-4
+                diff = pred_x0_grouped - target_x0_expanded
+                sum_sq = diff.pow(2).sum(dim=-1) 
+                es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
+                
+                diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                K_ens = sum_sq_div.shape[1]
+                eye_mask = torch.eye(K_ens, device=device_id).bool()
+                off_diag_mask = ~eye_mask # 取反，只保留非对角线
+                # 只检查非对角线元素（真正有意义的多样性）
+                masked_sum_sq_div = sum_sq_div[:, off_diag_mask]
 
-                    sq_error = (target_x0_expanded - ensemble_mean)**2
-                    nll_term1 = 0.5 * torch.log(ensemble_var)
-                    nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
-                    nll_per_element = nll_term1 + nll_term2
-                    nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
-                    loss_nll = (nll_per_element_clamped * weights).mean()
+                # print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
+                
+                if masked_sum_sq_div.numel() > 0: # 确保 K > 1
+                    # 计算 Diversity Score (只对非对角线取均值)
+                    # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
+                    es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
+                else:
+                    es_diversity = torch.tensor(0.0, device=device_id)
 
-                    loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
-                           cfg.ENERGY_LAMBDA * loss_energy + \
-                           cfg.NLL_LAMBDA * loss_nll
-                    
-                    loss = loss / cfg.ACCUMULATION_STEPS
+                es_combined = es_accuracy - 0.5 * es_diversity
+                loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
 
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"[Rank {rank}] NaN Loss Detected! Starting diagnosis...")
-                        debugger.diagnose_loss_detail(pred_x0_grouped, target_x0_expanded, weights)
-                        break
+                # --- [Part 4] Gaussian NLL Loss (方差扩张器) ---
+                # NLL = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
+                # 这一项对 var 极度敏感，能强力惩罚 var 过小的情况
+                sq_error = (target_x0_expanded - ensemble_mean)**2
+                nll_term1 = 0.5 * torch.log(ensemble_var)
+                nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
+                nll_per_element = nll_term1 + nll_term2
+                nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
+                loss_nll = (nll_per_element_clamped * weights).mean()
 
-                scaler.scale(loss).backward()
+                print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
+                # --- [Part 5] 总 Loss 组合 ---
+                loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
+                        cfg.ENERGY_LAMBDA * loss_energy + \
+                        cfg.NLL_LAMBDA * loss_nll
+                
+                loss = loss / cfg.ACCUMULATION_STEPS
+
+                # scaler.scale(loss).backward()
+                loss.backward()
                 batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
 
             if is_grad_update_step:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                # scaler.step(optimizer)
+                # scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 avg_loss_step = batch_loss_tracker
                 total_train_loss += avg_loss_step 
