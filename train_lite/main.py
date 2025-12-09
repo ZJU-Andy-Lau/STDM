@@ -212,7 +212,8 @@ def train():
     debugger = NanDebugger(ddp_model, logger=print if rank == 0 else lambda x: None)
 
     # --- 训练循环 (含回滚机制) ---
-    max_retries = 3
+    max_retries = 10
+    torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(cfg.EPOCHS):
         # [Checkpoint] 在 Epoch 开始前，保存当前状态到内存
@@ -325,7 +326,7 @@ def train():
 
                         loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
 
-                        eps_safe = 1e-6
+                        eps_safe = 1e-8
                         diff = pred_x0_grouped - target_x0_expanded
                         sum_sq = diff.pow(2).sum(dim=-1) 
                         es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
