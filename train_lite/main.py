@@ -256,7 +256,7 @@ def train():
     original_val_samples = create_sliding_windows(val_features, cfg.HISTORY_LEN, cfg.PRED_LEN)
     y_true_original = np.array([s[1][:, :, :cfg.TARGET_FEAT_DIM] for s in original_val_samples]).squeeze(-1)[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
 
-    max_retries = 10
+    max_retries = 3
     torch.autograd.set_detect_anomaly(True) # 开启 Anomaly Detection
 
     for epoch in range(cfg.EPOCHS):
@@ -388,11 +388,6 @@ def train():
                         print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
                         
                         if masked_sum_sq_div.numel() > 0: # 确保 K > 1
-                            min_div_val = masked_sum_sq_div.min().item()
-                            if min_div_val < 1e-9:
-                                print(f"\n[DEBUG-ENERGY] Batch {i}: Off-diagonal diversity term is extremely small: {min_div_val:.4e}")
-                                print("[ALERT] Mode Collapse Detected! Different ensemble members are predicting identical values.")
-
                             # 计算 Diversity Score (只对非对角线取均值)
                             # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
                             es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
