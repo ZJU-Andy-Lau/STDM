@@ -374,10 +374,15 @@ def train():
                             eps_safe = 1e-8
                             diff = pred_x0_grouped - target_x0_expanded
                             sum_sq = diff.pow(2).sum(dim=-1) 
+
+                            print(f"[acc] min:{sum_sq.min().item():.2e} \t max:{sum_sq.max().item():.2e} \t mean:{sum_sq.mean().item():.2e} \t median:{sum_sq.median().item():.2e}")
+
                             es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
                             
                             diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
                             sum_sq_div = diff_div.pow(2).sum(dim=-1)
+
+                            print(f"[div] min:{sum_sq_div.min().item():.2e} \t max:{sum_sq_div.max().item():.2e} \t mean:{sum_sq_div.mean().item():.2e} \t median:{sum_sq_div.median().item():.2e}")
                             
                             # --- [DEBUG TOOL 2] 多样性数值探针 ---
                             min_div_val = sum_sq_div.min().item()
