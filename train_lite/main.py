@@ -343,7 +343,7 @@ def train():
                 nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
                 loss_nll = (nll_per_element_clamped * weights).mean()
 
-                print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
+                # print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
                 # --- [Part 5] 总 Loss 组合 ---
                 loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                         cfg.ENERGY_LAMBDA * loss_energy + \
