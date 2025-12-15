@@ -39,7 +39,7 @@ class ConfigV2:
     ENERGY_LAMBDA = 1.0         
     
     # 3. Gaussian NLL: 强制拉开不确定性区间，防止方差坍塌 (权重建议较小)
-    NLL_LAMBDA = 0.01           
+    NLL_LAMBDA = 0.00           
     
     # Deprecated / Unused (设为 0.0 以禁用旧的冲突 Loss)
     INDIVIDUAL_L1_LAMBDA = 0.0   
@@ -65,7 +65,7 @@ class ConfigV2:
     EVAL_ON_VAL = True               
     EVAL_ON_VAL_EPOCH = 5            
     EVAL_ON_VAL_BATCHES = 48         
-    EVAL_ON_VAL_SAMPLES = 5          
+    EVAL_ON_VAL_SAMPLES = 10          
     EVAL_ON_VAL_STEPS = 20           
     SAMPLING_ETA = 1.0               
     EVAL_SEED = 42 
