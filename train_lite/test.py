@@ -132,7 +132,7 @@ def main():
                 device=f"cuda:{device_id}",
                 rank=rank,
                 world_size=world_size,
-                key=model_key
+                key=model_key+'_post_test'
             )
 
             if rank == 0 and metrics:

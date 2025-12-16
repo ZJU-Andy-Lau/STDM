@@ -213,14 +213,6 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
         y_true_original = y_true_original.squeeze(-1).transpose(0, 2, 1)
         all_samples = all_samples.squeeze(-1).transpose(1, 0, 3, 2)
 
-        print(f"y_true shape:{y_true_original.shape}")
-        print(f"all_predictions shape:{all_predictions.shape}")
-        print(f"all_samples shape:{all_samples.shape}")
-
-        np.save(f'./results/truths.npy', y_true_original)
-        np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
-        np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
-
         try:
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
@@ -235,6 +227,15 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_mm_path, scaler_
             print("\n警告：基线预测文件 ./urbanev/TimeXer_predictions.npy 未找到。")
             print("跳过 DM 显著性检验。")
             perform_significance = False
+        
+        print(f"y_true shape:{y_true_original.shape}")
+        print(f"all_predictions shape:{all_predictions.shape}")
+        print(f"all_samples shape:{all_samples.shape}")
+        print(f"all_baseline_shape:{all_baseline_preds.shape}")
+
+        np.save(f'./results/truths_{cfg.RUN_ID}_{key}.npy', y_true_original)
+        np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', all_predictions)
+        np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', all_samples)
 
         final_metrics = calculate_metrics(y_true_original, all_predictions, all_samples, cfg.DEVICE)
         if perform_significance:
