@@ -440,11 +440,13 @@ def train():
                 state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
                 torch.save(state_dict, model_save_path_best)
                 best_model_path_for_val = model_save_path_best
+                print(f"🎉 New best model saved to {model_save_path_best} with validation loss: {best_val_loss:.4f}")
             elif avg_val_loss < second_best_val_loss:
                 second_best_val_loss = avg_val_loss
                 state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
                 torch.save(state_dict, model_save_path_second_best)
                 second_best_model_path_for_val = model_save_path_second_best
+                print(f"🥈 New 2nd best model saved to {model_save_path_second_best} with validation loss: {second_best_val_loss:.4f}")
 
         # --- 周期性 MAE 评估 ---
         run_mae_eval = cfg.EVAL_ON_VAL and (epoch + 1) % cfg.EVAL_ON_VAL_EPOCH == 0
@@ -488,13 +490,15 @@ def train():
                         if os.path.exists(model_save_path_mae_second_best):
                             os.remove(model_save_path_mae_second_best)
                         os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
-                        second_best_model_path_for_val = model_save_path_mae_second_best
+                        second_best_model_path_for_eval = model_save_path_mae_second_best
                     torch.save(state_dict, model_save_path_mae_best)
                     best_model_path_for_eval = model_save_path_mae_best
+                    print(f"🎉 New best mae model saved to {model_save_path_mae_best} with validation MAE: {best_val_mae:.4f}")
+
                 elif current_val_mae < second_best_val_mae:
                     second_best_val_mae = current_val_mae
                     torch.save(state_dict, model_save_path_mae_second_best)
-                    second_best_model_path_for_val = model_save_path_mae_second_best
+                    second_best_model_path_for_eval = model_save_path_mae_second_best
 
         if rank == 0:
             csv_logger.log_epoch(epoch_log_data)
