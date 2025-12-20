@@ -434,6 +434,8 @@ def train():
                 second_best_val_loss = best_val_loss
                 best_val_loss = avg_val_loss
                 if best_model_path_for_val is not None and os.path.exists(best_model_path_for_val):
+                    if os.path.exists(model_save_path_second_best):
+                        os.remove(model_save_path_second_best)
                     os.rename(best_model_path_for_val, model_save_path_second_best)
                     second_best_model_path_for_val = model_save_path_second_best
                 
