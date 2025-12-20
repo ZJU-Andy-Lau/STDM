@@ -67,7 +67,7 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 48         
     EVAL_ON_VAL_SAMPLES = 10          
     EVAL_ON_VAL_STEPS = 20           
-    SAMPLING_ETA = 1.0               
+    SAMPLING_ETA = 0.0               
     EVAL_SEED = 42 
 
     TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi.npy'
