@@ -39,10 +39,12 @@ class ConfigV2:
     ENERGY_LAMBDA = 1.0         
     
     # 3. Gaussian NLL: 强制拉开不确定性区间，防止方差坍塌 (权重建议较小)
-    NLL_LAMBDA = 0.00           
+    NLL_LAMBDA = 0.01           
+
+    # 4. [NEW] Individual L1: 对每个样本的每个预测值计算 L1 Loss
+    INDIVIDUAL_L1_LAMBDA = 0.5
     
     # Deprecated / Unused (设为 0.0 以禁用旧的冲突 Loss)
-    INDIVIDUAL_L1_LAMBDA = 0.0   
     REPULSION_LAMBDA = 0.0
     BIAS_SUM_LAMBDA = 0.0
     VAR_LAMBDA = 0.0
