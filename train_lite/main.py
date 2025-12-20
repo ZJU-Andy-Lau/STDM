@@ -67,7 +67,7 @@ def train():
         cfg.RUN_ID = run_id
         print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
         print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
-        print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA})")
+        print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA}) + IndivL1({cfg.INDIVIDUAL_L1_LAMBDA})")
         
         os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
         
@@ -343,11 +343,17 @@ def train():
                 nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
                 loss_nll = (nll_per_element_clamped * weights).mean()
 
-                # print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e}")
+                # --- [Part 5] Individual L1 Loss ---
+                # 对每个样本的每个预测值计算 L1 Loss
+                diff_abs = torch.abs(pred_x0_grouped - target_x0_expanded)
+                loss_individual_l1 = (diff_abs * weights).mean()
+
+                # print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e} \t loss_l1:{loss_individual_l1.item():.2e}")
                 # --- [Part 5] 总 Loss 组合 ---
                 loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
                         cfg.ENERGY_LAMBDA * loss_energy + \
-                        cfg.NLL_LAMBDA * loss_nll
+                        cfg.NLL_LAMBDA * loss_nll + \
+                        cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1
                 
                 loss = loss / cfg.ACCUMULATION_STEPS
 
@@ -434,6 +440,8 @@ def train():
                 second_best_val_loss = best_val_loss
                 best_val_loss = avg_val_loss
                 if best_model_path_for_val is not None and os.path.exists(best_model_path_for_val):
+                    if os.path.exists(model_save_path_second_best):
+                        os.remove(model_save_path_second_best)
                     os.rename(best_model_path_for_val, model_save_path_second_best)
                     second_best_model_path_for_val = model_save_path_second_best
                 
