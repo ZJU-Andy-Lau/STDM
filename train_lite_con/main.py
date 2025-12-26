@@ -1,0 +1,573 @@
+import warnings
+warnings.filterwarnings("ignore")
+import sys
+import os
+
+current_file_path = os.path.abspath(__file__)
+current_dir = os.path.dirname(current_file_path)
+project_root = os.path.dirname(current_dir)
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+from tqdm import tqdm
+from datetime import datetime
+from torch.cuda import amp
+from contextlib import nullcontext
+import joblib
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+try:
+    from train_lite_con.config import ConfigV2
+    from train_lite_con.utils import CsvLogger, calc_layer_lengths
+    from train_lite_con.dataset import EVChargerDatasetV2, create_sliding_windows
+    from train_lite_con.metrics import print_metrics
+    from train_lite_con.evaluation import periodic_evaluate_mae, evaluate_model
+except ImportError:
+    from config import ConfigV2
+    from utils import CsvLogger, calc_layer_lengths
+    from dataset import EVChargerDatasetV2, create_sliding_windows
+    from metrics import print_metrics
+    from evaluation import periodic_evaluate_mae, evaluate_model
+
+from model_lite import SpatioTemporalDiffusionModelV2
+from scheduler import MultiStageOneCycleLR
+
+def train():
+    # --- DDP 初始化 ---
+    # 检查是否在 DDP 环境中
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = int(os.environ["RANK"])
+        device_id = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(device_id)
+    else:
+        # 单机 fallback (用于调试)
+        print("Warning: Not running in DDP mode. Fallback to single GPU.")
+        rank = 0
+        device_id = 0
+        world_size = 1
+        torch.cuda.set_device(0)
+
+    cfg = ConfigV2()
+
+    if rank == 0:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cfg.RUN_ID = run_id
+        print(f"Starting Training (Lite Mode). Run ID: {cfg.RUN_ID}")
+        print(f"Batch Size: {cfg.BATCH_SIZE}, Ensemble K: {cfg.ENSEMBLE_K}")
+        print(f"Loss Strategy: Energy({cfg.ENERGY_LAMBDA}) + MeanMSE({cfg.MEAN_MSE_LAMBDA}) + NLL({cfg.NLL_LAMBDA}) + IndivL1({cfg.INDIVIDUAL_L1_LAMBDA})")
+        
+        os.makedirs(os.path.dirname(cfg.MODEL_SAVE_PATH_TEMPLATE), exist_ok=True)
+        
+        # 路径模板
+        model_save_path_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="best")
+        model_save_path_second_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="second_best")
+        model_save_path_mae_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="mae_best")
+        model_save_path_mae_second_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="mae_second_best")
+
+        scaler_y_save_path = cfg.SCALER_Y_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+        scaler_e_save_path = cfg.SCALER_E_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+        scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+        scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+
+        best_val_loss = float('inf')
+        second_best_val_loss = float('inf')
+        best_val_mae = float('inf')
+        second_best_val_mae = float('inf')
+        best_model_path_for_eval = None
+        second_best_model_path_for_eval = None
+        best_model_path_for_val = None
+        second_best_model_path_for_val = None
+
+    # 同步 RUN_ID
+    if dist.is_initialized():
+        run_id_list = [cfg.RUN_ID]
+        dist.broadcast_object_list(run_id_list, src=0)
+        if rank != 0: 
+            cfg.RUN_ID = run_id_list[0]
+            scaler_y_save_path = cfg.SCALER_Y_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+            scaler_e_save_path = cfg.SCALER_E_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+            scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+            scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
+
+    # 日志
+    log_headers = ['epoch', 'avg_train_loss', 'avg_val_loss', 'lr', 'avg_val_mae']
+    csv_logger = CsvLogger(log_dir='./results', run_id=cfg.RUN_ID, rank=rank, headers=log_headers)
+
+    # --- 加载密集图 ---
+    adj_matrix = np.load(cfg.ADJ_MATRIX_PATH)
+    distances = adj_matrix[adj_matrix > 0]
+    sigma = np.std(distances)
+    adj_matrix = np.exp(-np.square(adj_matrix) / (sigma**2))
+    adj_matrix[adj_matrix < 0.1] = 0
+    # 转换为 Tensor，不生成 edge_index
+    adj_tensor = torch.from_numpy(adj_matrix).float().to(device_id)
+
+    # --- 数据加载 ---
+    train_features = np.load(cfg.TRAIN_FEATURES_PATH)
+    val_features = np.load(cfg.VAL_FEATURES_PATH)
+
+    did_bate_8_path = cfg.DID_BETA_8_PATH
+    did_bate_12_path = cfg.DID_BETA_12_PATH
+    train_did_policy_8_path = cfg.TRAIN_DID_POLICY_8_PATH
+    valid_did_policy_8_path = cfg.VALID_DID_POLICY_8_PATH
+    train_did_policy_12_path = cfg.TRAIN_DID_POLICY_12_PATH
+    valid_did_policy_12_path = cfg.VALID_DID_POLICY_12_PATH
+    
+    train_dataset = EVChargerDatasetV2(train_features, 
+                                       cfg.HISTORY_LEN, 
+                                       cfg.PRED_LEN, cfg,
+                                       did_beta_8am_path=did_bate_8_path,
+                                       did_beta_12am_path=did_bate_12_path,
+                                       did_policy_8am_path=train_did_policy_8_path,
+                                       did_policy_12am_path=train_did_policy_12_path
+                                       )
+    
+    if dist.is_initialized():
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        train_sampler = None
+
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=cfg.BATCH_SIZE, 
+        sampler=train_sampler, 
+        shuffle=(train_sampler is None),
+        drop_last=True, 
+        pin_memory=True, 
+        num_workers=4
+    )
+    
+    if rank == 0:
+        print(f"Train Dataset Size: {len(train_dataset)}, Steps per Epoch: {len(train_dataloader)}")
+        if cfg.NORMALIZATION_TYPE != "none":
+            scaler_y, scaler_e, scaler_mm, scaler_z = train_dataset.get_scaler()
+            joblib.dump(scaler_y, scaler_y_save_path)
+            joblib.dump(scaler_e, scaler_e_save_path)
+            joblib.dump(scaler_mm, scaler_mm_save_path)
+            joblib.dump(scaler_z, scaler_z_save_path)
+    if dist.is_initialized():
+        dist.barrier()
+
+    train_y_scaler = joblib.load(scaler_y_save_path) if os.path.exists(scaler_y_save_path) else None
+    train_e_scaler = joblib.load(scaler_e_save_path) if os.path.exists(scaler_e_save_path) else None
+    train_mm_scaler = joblib.load(scaler_mm_save_path) if os.path.exists(scaler_mm_save_path) else None
+    train_z_scaler = joblib.load(scaler_z_save_path) if os.path.exists(scaler_z_save_path) else None
+
+    val_dataset = EVChargerDatasetV2(val_features, 
+                                     cfg.HISTORY_LEN, 
+                                     cfg.PRED_LEN, cfg, 
+                                     scaler_y=train_y_scaler, 
+                                     scaler_e=train_e_scaler, 
+                                     scaler_mm=train_mm_scaler, 
+                                     scaler_z=train_z_scaler,
+                                     did_beta_8am_path=did_bate_8_path,
+                                     did_beta_12am_path=did_bate_12_path,
+                                     did_policy_8am_path=valid_did_policy_8_path,
+                                     did_policy_12am_path=valid_did_policy_12_path
+                                    )
+    
+    if dist.is_initialized():
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        val_sampler = None
+
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=cfg.BATCH_SIZE, 
+        sampler=val_sampler, 
+        drop_last=True, 
+        pin_memory=True, 
+        num_workers=4
+    )
+    
+    val_eval_indices = list(range(len(val_dataset)))
+    val_eval_indices_subset = val_eval_indices[:cfg.EVAL_ON_VAL_BATCHES * cfg.BATCH_SIZE]
+    val_eval_dataset = Subset(val_dataset, val_eval_indices_subset)
+    
+    if dist.is_initialized():
+        val_eval_sampler = DistributedSampler(val_eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        val_eval_sampler = None
+
+    val_eval_loader = DataLoader(
+        val_eval_dataset,
+        batch_size=cfg.BATCH_SIZE,
+        num_workers=4,
+        pin_memory=True,
+        sampler=val_eval_sampler
+    )
+
+    # --- 模型初始化 ---
+    model = SpatioTemporalDiffusionModelV2(
+        in_features=cfg.TARGET_FEAT_DIM, out_features=cfg.TARGET_FEAT_DIM,
+        history_features=cfg.HISTORY_FEATURES, static_features=cfg.STATIC_FEATURES, future_known_features=cfg.FUTURE_KNOWN_FEAT_DIM,
+        model_dim=cfg.MODEL_DIM, num_heads=cfg.NUM_HEADS, T=cfg.T, depth=cfg.DEPTH,
+        max_channels=cfg.MAX_CHANNELS 
+    ).to(device_id)
+    
+    if dist.is_initialized():
+        ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=False)
+    else:
+        ddp_model = model
+
+    optimizer = optim.AdamW(ddp_model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
+    scaler = amp.GradScaler()
+
+    scheduler = MultiStageOneCycleLR(optimizer=optimizer,
+                                     total_steps=cfg.EPOCHS,
+                                     warmup_ratio=cfg.WARMUP_EPOCHS / cfg.EPOCHS,
+                                     cooldown_ratio=cfg.COOLDOWN_EPOCHS / cfg.EPOCHS)
+
+    # --- 训练循环 ---
+    for epoch in range(cfg.EPOCHS):
+        if dist.is_initialized():
+            train_sampler.set_epoch(epoch)
+            
+        ddp_model.train()
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS} [Train]", disable=(rank != 0))
+        total_train_loss = 0.0
+        batch_loss_tracker = 0.0
+        optimizer.zero_grad()
+
+        for i, (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx) in enumerate(progress_bar):
+            # 判断是否是梯度更新步
+            is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
+            
+            # DDP 上下文管理 (Accumulation 时不同步梯度)
+            if is_grad_update_step:
+                context = nullcontext()
+            else:
+                if dist.is_initialized():
+                    context = ddp_model.no_sync()
+                else:
+                    context = nullcontext()
+            
+            with context:
+                # with amp.autocast():
+                # 1. 数据上 GPU 
+                hist_batch = history_c.to(device_id)
+                stat_batch = static_c.to(device_id)
+                future_batch = target_e0.to(device_id)   # residual ground truth
+                mu_batch     = mu_future.to(device_id)   # 如果你不在训练loss里用mu，也可以不to(device)；但建议to以便后续扩展
+                known_batch  = future_known_c.to(device_id)
+                
+                B = hist_batch.shape[0]
+                K = cfg.ENSEMBLE_K
+
+                # 2. 扩展 Batch 以适配 Ensemble，并修正维度顺序
+                # (B, L, N, C) -> (B*K, N, L, C)
+                hist_exp = hist_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3) 
+                
+                # Static: (B, N, F) -> (B*K, N, F) 
+                stat_exp = stat_batch.repeat_interleave(K, dim=0)
+                
+                # Future & Known: (B, L, N, C) -> (B*K, N, L, C)
+                future_exp = future_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                known_exp = known_batch.repeat_interleave(K, dim=0).permute(0, 2, 1, 3)
+                
+                # 3. 扩散过程
+                noise = torch.randn_like(future_exp) # Shape: (B*K, N, L, C)
+                
+                # 生成时间步 t
+                t_per_sample = torch.randint(0, cfg.T, (B,), device=device_id).long()
+                t_exp = t_per_sample.repeat_interleave(K) # [t1, t1, t2, t2...]
+
+                # 获取 alpha_bar
+                if dist.is_initialized():
+                    sqrt_alpha_bar = ddp_model.module.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                    sqrt_one_minus_alpha_bar = ddp_model.module.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                else:
+                    sqrt_alpha_bar = ddp_model.sqrt_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                    sqrt_one_minus_alpha_bar = ddp_model.sqrt_one_minus_alphas_cumprod[t_exp].view(B*K, 1, 1, 1)
+                
+                x_t = sqrt_alpha_bar * future_exp + sqrt_one_minus_alpha_bar * noise
+                x_t.requires_grad_(True)
+
+                # 4. 模型预测
+                predicted_noise = ddp_model(
+                    x_t, t_exp, hist_exp, stat_exp, known_exp, adj_tensor
+                )
+                
+                # 5. Loss 计算 (New Strategy: Energy + MeanMSE + NLL)
+                pred_x0_exp = (x_t - sqrt_one_minus_alpha_bar * predicted_noise) / (sqrt_alpha_bar + 1e-8)
+                
+                # Reshape 以分组: (B, K, N, L, C)
+                pred_x0_grouped = pred_x0_exp.view(B, K, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM)
+                
+                # Target 准备: (B, 1, N, L, C)
+                target_x0 = future_batch.permute(0, 2, 1, 3) 
+                target_x0_expanded = target_x0.unsqueeze(1) 
+                
+                # Weights: (B, 1, 1, 1, 1)
+                if dist.is_initialized():
+                    alphas_cumprod = ddp_model.module.alphas_cumprod
+                else:
+                    alphas_cumprod = ddp_model.alphas_cumprod
+                    
+                weights = alphas_cumprod[t_exp].view(B, K, 1, 1, 1)
+                weights = weights[:, 0:1, :, :, :] 
+
+                # --- [Part 1] 统计量计算 ---
+                # 均值 (B, 1, N, L, C)
+                ensemble_mean = pred_x0_grouped.mean(dim=1, keepdim=True)
+                # 方差 (B, 1, N, L, C), 使用 clamp 避免除零，1e-6 确保数值稳定
+                ensemble_var = pred_x0_grouped.var(dim=1, unbiased=True, keepdim=True)
+                ensemble_var = torch.clamp(ensemble_var, min=1e-4)
+
+                # --- [Part 2] Mean MSE Loss (定海神针) ---
+                # 确保分布的中心对齐真值，防止漂移
+                loss_mean_mse = ((ensemble_mean - target_x0_expanded)**2 * weights).mean()
+
+                # --- [Part 3] Energy Loss (CRPS 推广 - 总指挥) ---
+                # Energy Score = E||X-y|| - 0.5 * E||X-X'||
+                
+                # 3.1 准确性项 (Accuracy): ||X - y||
+                eps_safe = 1e-4
+                diff = pred_x0_grouped - target_x0_expanded
+                sum_sq = diff.pow(2).sum(dim=-1) 
+                es_accuracy = torch.sqrt(sum_sq + eps_safe).mean(dim=1)
+                
+                diff_div = pred_x0_grouped.unsqueeze(2) - pred_x0_grouped.unsqueeze(1)
+                sum_sq_div = diff_div.pow(2).sum(dim=-1)
+                K_ens = sum_sq_div.shape[1]
+                eye_mask = torch.eye(K_ens, device=device_id).bool()
+                off_diag_mask = ~eye_mask # 取反，只保留非对角线
+                # 只检查非对角线元素（真正有意义的多样性）
+                masked_sum_sq_div = sum_sq_div[:, off_diag_mask]
+
+                # print(f"[div] min:{masked_sum_sq_div.min().item():.2e} \t max:{masked_sum_sq_div.max().item():.2e} \t mean:{masked_sum_sq_div.mean().item():.2e} \t median:{masked_sum_sq_div.median().item():.2e}")
+                
+                if masked_sum_sq_div.numel() > 0: # 确保 K > 1
+                    # 计算 Diversity Score (只对非对角线取均值)
+                    # sum_sq_div[:, off_diag_mask] 会将 KxK 展平为 K*(K-1)
+                    es_diversity = torch.sqrt(masked_sum_sq_div + eps_safe).mean(dim=1)
+                else:
+                    es_diversity = torch.tensor(0.0, device=device_id)
+
+                es_combined = es_accuracy - 0.5 * es_diversity
+                loss_energy = (es_combined.unsqueeze(1).unsqueeze(-1) * weights).mean()
+
+                # --- [Part 4] Gaussian NLL Loss (方差扩张器) ---
+                # NLL = 0.5 * log(var) + 0.5 * (target - mean)^2 / var
+                # 这一项对 var 极度敏感，能强力惩罚 var 过小的情况
+                sq_error = (target_x0_expanded - ensemble_mean)**2
+                nll_term1 = 0.5 * torch.log(ensemble_var)
+                nll_term2 = 0.5 * sq_error / (ensemble_var + 1e-8)
+                nll_per_element = nll_term1 + nll_term2
+                nll_per_element_clamped = torch.clamp(nll_per_element, max=100.0) 
+                loss_nll = (nll_per_element_clamped * weights).mean()
+
+                # --- [Part 5] Individual L1 Loss ---
+                # 对每个样本的每个预测值计算 L1 Loss
+                diff_abs = torch.abs(pred_x0_grouped - target_x0_expanded)
+                loss_individual_l1 = (diff_abs * weights).mean()
+
+                # print(f"loss_energy:{loss_energy.item():.2e} \t loss_mse:{loss_mean_mse.item():.2e} \t loss_nll:{loss_nll.item():.2e} \t loss_l1:{loss_individual_l1.item():.2e}")
+                # --- [Part 5] 总 Loss 组合 ---
+                loss = cfg.MEAN_MSE_LAMBDA * loss_mean_mse + \
+                        cfg.ENERGY_LAMBDA * loss_energy + \
+                        cfg.NLL_LAMBDA * loss_nll + \
+                        cfg.INDIVIDUAL_L1_LAMBDA * loss_individual_l1
+                
+                loss = loss / cfg.ACCUMULATION_STEPS
+
+                # scaler.scale(loss).backward()
+                loss.backward()
+                batch_loss_tracker += loss.item() * cfg.ACCUMULATION_STEPS
+
+            if is_grad_update_step:
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
+                # scaler.step(optimizer)
+                # scaler.update()
+                optimizer.step()
+                optimizer.zero_grad()
+                avg_loss_step = batch_loss_tracker
+                total_train_loss += avg_loss_step 
+                batch_loss_tracker = 0.0 
+                if rank == 0: progress_bar.set_postfix(loss=avg_loss_step)
+            else:
+                pass
+
+        # --- 验证循环 ---
+        ddp_model.eval()
+        total_val_loss = 0
+        
+        with torch.no_grad():
+            for tensors in val_dataloader:
+                history_c, static_c, target_e0, mu_future, future_known_c = [d.to(device_id) for d in tensors[:5]]
+                with amp.autocast():
+                    # future_x0: (B, L, N, C) -> 需要调整为 (B, N, L, C)
+                    target_e0 = target_e0.permute(0, 2, 1, 3)
+                    # history_c: (B, L, N, C) -> (B, N, L, C)
+                    history_c = history_c.permute(0, 2, 1, 3)
+                    # future_known_c: (B, L, N, C) -> (B, N, L, C)
+                    future_known_c = future_known_c.permute(0, 2, 1, 3)
+                    
+                    b = target_e0.shape[0]
+                    noise = torch.randn_like(target_e0) # (B, N, L, C)
+                    
+                    k = torch.randint(0, cfg.T, (b,), device=device_id).long()
+                    
+                    if dist.is_initialized():
+                        sqrt_alpha = ddp_model.module.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
+                        sqrt_one_minus = ddp_model.module.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
+                    else:
+                        sqrt_alpha = ddp_model.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
+                        sqrt_one_minus = ddp_model.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
+
+                    x_k = sqrt_alpha * target_e0 + sqrt_one_minus * noise
+                    
+                    pred_noise = ddp_model(x_k, k, history_c, static_c, future_known_c, adj_tensor)
+                    val_loss = nn.MSELoss()(pred_noise, noise)
+                    total_val_loss += val_loss.item()
+
+        # --- Loss 聚合与日志 ---
+        num_updates = len(train_dataloader) / cfg.ACCUMULATION_STEPS
+        avg_train_loss_local = total_train_loss / max(num_updates, 1)
+        
+        avg_train_loss_tensor = torch.tensor(avg_train_loss_local).to(device_id)
+        if dist.is_initialized():
+            dist.all_reduce(avg_train_loss_tensor, op=dist.ReduceOp.SUM)
+            avg_train_loss = avg_train_loss_tensor.item() / world_size
+        else:
+            avg_train_loss = avg_train_loss_local
+
+        avg_val_loss_local = total_val_loss / len(val_dataloader)
+        avg_val_loss_tensor = torch.tensor(avg_val_loss_local).to(device_id)
+        if dist.is_initialized():
+            dist.all_reduce(avg_val_loss_tensor, op=dist.ReduceOp.SUM)
+            avg_val_loss = avg_val_loss_tensor.item() / world_size
+        else:
+            avg_val_loss = avg_val_loss_local
+
+        if rank == 0:
+            epoch_log_data = {
+                'epoch': epoch + 1,
+                'avg_train_loss': avg_train_loss,
+                'avg_val_loss': avg_val_loss,
+                'lr': optimizer.param_groups[0]['lr'],
+                'avg_val_mae': '' 
+            }
+            print(f"Epoch {epoch+1} Summary: Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
+            
+            if avg_val_loss < best_val_loss:
+                second_best_val_loss = best_val_loss
+                best_val_loss = avg_val_loss
+                if best_model_path_for_val is not None and os.path.exists(best_model_path_for_val):
+                    if os.path.exists(model_save_path_second_best):
+                        os.remove(model_save_path_second_best)
+                    os.rename(best_model_path_for_val, model_save_path_second_best)
+                    second_best_model_path_for_val = model_save_path_second_best
+                
+                state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
+                torch.save(state_dict, model_save_path_best)
+                best_model_path_for_val = model_save_path_best
+                print(f"🎉 New best model saved to {model_save_path_best} with validation loss: {best_val_loss:.4f}")
+            elif avg_val_loss < second_best_val_loss:
+                second_best_val_loss = avg_val_loss
+                state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
+                torch.save(state_dict, model_save_path_second_best)
+                second_best_model_path_for_val = model_save_path_second_best
+                print(f"🥈 New 2nd best model saved to {model_save_path_second_best} with validation loss: {second_best_val_loss:.4f}")
+
+        # --- 周期性 MAE 评估 ---
+        run_mae_eval = cfg.EVAL_ON_VAL and (epoch + 1) % cfg.EVAL_ON_VAL_EPOCH == 0
+        if run_mae_eval:
+            current_val_mae = float('inf') 
+            if rank == 0: print(f"Epoch {epoch+1}, running periodic MAE evaluation...")
+            
+            model_to_eval = ddp_model.module if dist.is_initialized() else ddp_model
+            local_pred, local_true = periodic_evaluate_mae(
+                model_to_eval, 
+                val_eval_loader,
+                train_e_scaler,
+                adj_tensor,
+                cfg,
+                device_id
+            )
+        
+            if dist.is_initialized():
+                gathered_pred = [None] * world_size
+                gathered_true = [None] * world_size
+
+                dist.gather_object(local_pred, gathered_pred if rank == 0 else None, dst=0)
+                dist.gather_object(local_true, gathered_true if rank == 0 else None, dst=0)
+            else:
+                gathered_pred = [local_pred]
+                gathered_true = [local_true]
+
+            if rank == 0:
+                y_pred = np.concatenate(gathered_pred, axis=0)
+                y_true = np.concatenate(gathered_true, axis=0)
+                current_val_mae = np.mean(np.abs(y_pred - y_true))
+                epoch_log_data['avg_val_mae'] = current_val_mae
+                print(f"[Val] Avg MAE: {current_val_mae:.4f}")
+
+                state_dict = ddp_model.module.state_dict() if dist.is_initialized() else ddp_model.state_dict()
+                
+                if current_val_mae < best_val_mae:
+                    second_best_val_mae = best_val_mae
+                    best_val_mae = current_val_mae
+                    if best_model_path_for_eval is not None and os.path.exists(best_model_path_for_eval):
+                        if os.path.exists(model_save_path_mae_second_best):
+                            os.remove(model_save_path_mae_second_best)
+                        os.rename(best_model_path_for_eval, model_save_path_mae_second_best)
+                        second_best_model_path_for_eval = model_save_path_mae_second_best
+                    torch.save(state_dict, model_save_path_mae_best)
+                    best_model_path_for_eval = model_save_path_mae_best
+                    print(f"🎉 New best mae model saved to {model_save_path_mae_best} with validation MAE: {best_val_mae:.4f}")
+
+                elif current_val_mae < second_best_val_mae:
+                    second_best_val_mae = current_val_mae
+                    torch.save(state_dict, model_save_path_mae_second_best)
+                    second_best_model_path_for_eval = model_save_path_mae_second_best
+
+        if rank == 0:
+            csv_logger.log_epoch(epoch_log_data)
+
+        if dist.is_initialized():
+            dist.barrier()
+        scheduler.step()
+
+    if dist.is_initialized():
+        dist.barrier()
+    
+    if rank == 0:
+        print("\n" + "="*50 + "\nTraining finished. Starting evaluation on the test set...\n" + "="*50 + "\n")
+    
+    path_list_to_eval = [best_model_path_for_eval, second_best_model_path_for_eval, best_model_path_for_val, second_best_model_path_for_val] if rank == 0 else [None, None, None, None]
+    
+    if dist.is_initialized():
+        dist.broadcast_object_list(path_list_to_eval, src=0)
+    
+    best_model_path_synced, second_best_model_path_synced, best_model_path_for_val_synced, second_best_model_path_for_val_synced = path_list_to_eval
+
+    def run_eval(path, key_name, desc):
+        if path and os.path.exists(path):
+            if rank == 0: print(f"\n[ALL GPUS] Evaluating {desc}: {os.path.basename(path)}")
+            metrics = evaluate_model(cfg, path, scaler_y_save_path, scaler_e_save_path, scaler_mm_save_path, scaler_z_save_path, device=f"cuda:{device_id}", rank=rank, world_size=world_size, key=key_name)
+            if rank == 0: print_metrics(metrics)
+
+    run_eval(best_model_path_for_val_synced, 'best_val', 'BEST VAL model')
+    run_eval(second_best_model_path_for_val_synced, 'second_best_val', '2ND BEST VAL model')
+    run_eval(best_model_path_synced, 'best', 'BEST MAE model')
+    run_eval(second_best_model_path_synced, 'second_best', '2ND BEST MAE model')
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    train()
