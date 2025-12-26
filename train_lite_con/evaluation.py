@@ -256,7 +256,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
             all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
             all_baseline_preds = all_baseline_preds[:y_pred.shape[0]]
-            y_true_original = y_true_original[:all_baseline_preds.shape[0]]
+            y_true = y_true[:all_baseline_preds.shape[0]]
             y_pred = y_pred[:all_baseline_preds.shape[0]]
             y_samp = y_samp[:all_baseline_preds.shape[0]]
             print("\n已加载基线模型 (TimeXer) 预测，用于 DM 显著性检验。")
@@ -267,19 +267,19 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
             print("跳过 DM 显著性检验。")
             perform_significance = False
         
-        print(f"y_true shape:{y_true_original.shape}")
+        print(f"y_true shape:{y_true.shape}")
         print(f"y_pred shape:{y_pred.shape}")
         print(f"y_samp shape:{y_samp.shape}")
         print(f"all_baseline_shape:{all_baseline_preds.shape}")
 
-        np.save(f'./results/truths_{cfg.RUN_ID}_{key}.npy', y_true_original)
+        np.save(f'./results/truths_{cfg.RUN_ID}_{key}.npy', y_true)
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', y_pred)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', y_samp)
 
-        final_metrics = calculate_metrics(y_true_original, y_pred, y_samp, cfg.DEVICE)
+        final_metrics = calculate_metrics(y_true, y_pred, y_samp, cfg.DEVICE)
         if perform_significance:
-            errors_model = np.abs(y_true_original.flatten() - y_pred.flatten())
-            errors_baseline = np.abs(y_true_original.flatten() - all_baseline_preds.flatten())
+            errors_model = np.abs(y_true.flatten() - y_pred.flatten())
+            errors_baseline = np.abs(y_true.flatten() - all_baseline_preds.flatten())
             dm_statistic, p_value = dm_test(errors_baseline, errors_model)
             final_metrics['dm_stat'] = dm_statistic
             final_metrics['p_value'] = p_value
