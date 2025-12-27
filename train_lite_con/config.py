@@ -13,7 +13,13 @@ class ConfigV2:
     TARGET_FEAT_DIM = 1
     DYNAMIC_FEAT_DIM = 12
     STATIC_FEAT_DIM = 7
-    FUTURE_KNOWN_FEAT_DIM = 13
+    
+    # [修改点] 显式增加 DID 相关的 5 个特征维度 (own, amp, expo_ctrl, expo_tc, total)
+    DID_FEAT_DIM = 5
+    
+    # [修改点] 原始 future known (13) + DID features (5)
+    # 原始 13 维通常包含: 时间编码(month, day, hour, min, dow, is_holiday) + 天气/POI等
+    FUTURE_KNOWN_FEAT_DIM = 13 + DID_FEAT_DIM
     
     HISTORY_FEATURES = TARGET_FEAT_DIM + DYNAMIC_FEAT_DIM
     STATIC_FEATURES = STATIC_FEAT_DIM

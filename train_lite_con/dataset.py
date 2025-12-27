@@ -112,8 +112,9 @@ class EVChargerDatasetV2(Dataset):
             # y_future_raw: (L, N, 1)
             y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM].astype(np.float64)
 
-            # mu_future_raw: (L, N, 1)
-            mu_future_raw = self._build_mu_future(start_idx).astype(np.float64)
+            # 获取 mu 用于计算残差，忽略 components
+            mu_future_raw, _ = self._build_mu_future(start_idx)
+            mu_future_raw = mu_future_raw.astype(np.float64)
 
             e_raw = y_future_raw - mu_future_raw  # (L, N, 1)
             x = e_raw.reshape(-1)                 # flatten
@@ -158,9 +159,6 @@ class EVChargerDatasetV2(Dataset):
         scaler.fit(data.reshape(-1, data.shape[-1]))
         return scaler
 
-    # ============================================================
-    # DID: 资源加载与 beta(分钟)->beta(小时12步)
-    # ============================================================
     def _load_did_resources(
         self,
         did_policy_8am_path,
@@ -171,9 +169,6 @@ class EVChargerDatasetV2(Dataset):
         pol8 = np.load(did_policy_8am_path, allow_pickle=True)
         pol12 = np.load(did_policy_12am_path, allow_pickle=True)
 
-        # -------------------------
-        # 1) policy：合并到统一 key 空间
-        # -------------------------
         required8 = ["D8", "PSM_IN8", "delta_p8", "expo_ctrl8", "expo_tc8"]
         required12 = ["D12", "PSM_IN12", "delta_p12", "expo_ctrl12", "expo_tc12"]
 
@@ -191,10 +186,6 @@ class EVChargerDatasetV2(Dataset):
 
         self.policy = policy
 
-        # -------------------------
-        # 2) beta：8am / 12pm 分别读取并插值到小时 12 步
-        #     你的 beta 文件：r_grid + 4 条 (R,) 曲线
-        # -------------------------
         def load_one_beta(beta_path_8am, beta_path_12am):
             bnpz_8am = np.load(beta_path_8am, allow_pickle=True)
             bnpz_12am = np.load(beta_path_12am, allow_pickle=True)
@@ -218,25 +209,8 @@ class EVChargerDatasetV2(Dataset):
             beta_tx_12am  = bnpz_12am["beta_tx"].astype(np.float32)    # (R,)
 
             def build_hourly_beta_from_5min(r_grid, beta_own, beta_amp, beta_exp, beta_tx, hour_bins):
-                """
-                将 5 分钟级 DID beta 聚合为小时级 beta
-                Parameters
-                ----------
-                r_grid : np.ndarray
-                    shape (R,), 单位：分钟，例如 [-180, -175, ..., 120]
-                beta_own / amp / exp / tx : np.ndarray
-                    shape (R,)
-                hour_bins : list[int]
-                    例如 [-2, -1, 0, 1, 2]
-
-                Returns
-                -------
-                beta_dict : dict
-                    {hour: np.array([β_own, β_amp, β_exp, β_tx])}
-                """
                 beta_dict = {}
                 for h in hour_bins:
-                    # 该小时对应的分钟区间
                     left  = h * 60
                     right = (h + 1) * 60
                     mask = (r_grid >= left) & (r_grid < right)
@@ -258,46 +232,34 @@ class EVChargerDatasetV2(Dataset):
             self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0, 1]
             )
 
-            # 12 点：[0, +1, +2]
             self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
         
         load_one_beta(did_beta_8am_path, did_beta_12am_path)
-        # load_one_beta(did_beta_12am_path, "12am")
 
-    # ============================================================
-    # 5) 构造 μ（严格的三重 gate：事件 × PSM × 时间）
-    # ============================================================
     def _build_mu_future(self, start_idx):
         """
-        构造未来预测窗口的结构均值 μ(t)
-        - 支持 8 点抢充（-3h ~ +2h）
-        - 支持 12 点降价（0h ~ +2h）
-        - beta 已预先按小时离散好，不再插值
+        Returns:
+            mu: (Lf, N, 1) - 总均值，用于Target
+            mu_comps: (Lf, N, 5) - 分量[own, amp, ec, tc, total]，用于特征
         """
         Lf = self.pred_len
         N = self.cfg.NUM_NODES
         mu = np.zeros((Lf, N, self.cfg.TARGET_FEAT_DIM), dtype=np.float32)
+        mu_comps = np.zeros((Lf, N, 5), dtype=np.float32)
 
         if not (self.enable_did and self.did_ready):
-            return mu
+            return mu, mu_comps
 
-        # ========== 1) 当前样本未来窗口在全局时间轴上的切片 ==========
         d0 = min((start_idx + self.history_len+self.pred_len//2)//24, self.policy["D8"].shape[0]-1) 
         
-        # ============================
-        # 1. 未来时间索引（小时）
-        # ============================
         t0 = start_idx + self.history_len
         future_idx = np.arange(t0, t0 + Lf)
 
-        # 每一步对应的小时（0–23）
         hour_of_day = future_idx % 24
 
-        # 相对事件时间（小时）
         rel8  = hour_of_day - 8
         rel12 = hour_of_day - 12
 
-        # policy slices: (Lf, N)
         D8   = self.policy["D8"][d0]
         D12  = self.policy["D12"][d0]
         PSM8  = self.policy["PSM_IN8"][d0]
@@ -311,31 +273,39 @@ class EVChargerDatasetV2(Dataset):
         tc8   = self.policy["expo_tc8"][d0]
         tc12  = self.policy["expo_tc12"][d0]
 
-        # ============================
-        # 3. 构造 mu（核心修改）
-        # ============================
         for k in range(Lf):
-            # ---------- 8 点事件 ----------
             r8 = rel8[k]
             if r8 in self.beta_8:
                 b = self.beta_8[r8]
-                mu[k, :, 0] += (
-                    b[0] * D8
-                    + b[1] * D8 * dp8
-                    + b[2] * ec8
-                    + b[3] * tc8
-                ) * PSM8
-            # ---------- 12 点事件 ----------
+                
+                term_own = b[0] * D8 * PSM8
+                term_amp = b[1] * D8 * dp8 * PSM8
+                term_ec  = b[2] * ec8 * PSM8
+                term_tc  = b[3] * tc8 * PSM8
+                
+                mu_comps[k, :, 0] += term_own
+                mu_comps[k, :, 1] += term_amp
+                mu_comps[k, :, 2] += term_ec
+                mu_comps[k, :, 3] += term_tc
+                mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
+
             r12 = rel12[k]
-            if r12 in self.beta_12:   # ★ 只在 [0,2] 内生效
+            if r12 in self.beta_12:
                 b = self.beta_12[r12]
-                mu[k, :, 0] += (
-                    b[0] * D12
-                    + b[1] * D12 * dp12
-                    + b[2] * ec12
-                    + b[3] * tc12
-                ) * PSM12
-        return mu
+                
+                term_own = b[0] * D12 * PSM12
+                term_amp = b[1] * D12 * dp12 * PSM12
+                term_ec  = b[2] * ec12 * PSM12
+                term_tc  = b[3] * tc12 * PSM12
+                
+                mu_comps[k, :, 0] += term_own
+                mu_comps[k, :, 1] += term_amp
+                mu_comps[k, :, 2] += term_ec
+                mu_comps[k, :, 3] += term_tc
+                mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
+        
+        mu[:, :, 0] = mu_comps[:, :, 4]
+        return mu, mu_comps
 
     def __len__(self):
         return len(self.samples)
@@ -345,16 +315,21 @@ class EVChargerDatasetV2(Dataset):
 
         history_c = torch.tensor(history, dtype=torch.float)
 
-        future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float) # 没经过归一化的occ
+        future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float) 
 
-        known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - self.cfg.FUTURE_KNOWN_FEAT_DIM)
+        # 计算切片索引，需排除新增的DID维度，使用原始的13维来定位
+        orig_future_known_dim = self.cfg.FUTURE_KNOWN_FEAT_DIM - self.cfg.DID_FEAT_DIM
+        known_start_idx = self.cfg.TARGET_FEAT_DIM + (self.cfg.DYNAMIC_FEAT_DIM - orig_future_known_dim)
+        
         future_known_c = torch.tensor(
             future[:, :, known_start_idx: self.cfg.HISTORY_FEATURES],
             dtype=torch.float
         )
 
-        mu_future_np = self._build_mu_future(start_idx)
+        mu_future_np, mu_comps_np = self._build_mu_future(start_idx)
         mu_future = torch.tensor(mu_future_np, dtype=torch.float)
+        
+        mu_comps = torch.tensor(mu_comps_np, dtype=torch.float)
 
         e_raw = future_x0 - mu_future
         e_raw_np = e_raw.numpy().reshape(-1, 1)
@@ -365,6 +340,8 @@ class EVChargerDatasetV2(Dataset):
             e_norm_np.reshape(e_raw.shape),
             dtype=torch.float
         )
+
+        future_known_c = torch.cat([future_known_c, mu_comps], dim=-1)
 
         return history_c, self.static_features, target_e0, mu_future, future_known_c, idx, start_idx
 
