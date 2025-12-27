@@ -330,6 +330,7 @@ class EVChargerDatasetV2(Dataset):
         mu_future = torch.tensor(mu_future_np, dtype=torch.float)
         
         mu_comps = torch.tensor(mu_comps_np, dtype=torch.float)
+        mu_comps = mu_comps / (self.scaler_e.scale_[0] + 1e-8) #归一化did特征
 
         e_raw = future_x0 - mu_future
         e_raw_np = e_raw.numpy().reshape(-1, 1)
