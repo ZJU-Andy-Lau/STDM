@@ -51,7 +51,7 @@ class ConfigV2:
     
     # 训练参数
     EPOCHS = 100
-    BATCH_SIZE = 16 
+    BATCH_SIZE = 12 
     LEARNING_RATE = 5e-4
     ACCUMULATION_STEPS = 1
 
