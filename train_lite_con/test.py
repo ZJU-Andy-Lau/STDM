@@ -20,9 +20,9 @@ if current_dir not in sys.path:
 # --- 2. 导入模块 ---
 # 尝试包内导入或直接导入
 try:
-    from train_lite.config import ConfigV2
-    from train_lite.metrics import print_metrics
-    from train_lite.evaluation import evaluate_model
+    from train_lite_con.config import ConfigV2
+    from train_lite_con.metrics import print_metrics
+    from train_lite_con.evaluation import evaluate_model
 except ImportError:
     from config import ConfigV2
     from metrics import print_metrics
