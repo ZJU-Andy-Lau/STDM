@@ -71,6 +71,7 @@ def main():
     
     # Scaler 路径
     scaler_y_path = cfg.SCALER_Y_SAVE_PATH_TEMPLATE.format(run_id=target_run_id)
+    scaler_e_path = cfg.SCALER_E_SAVE_PATH_TEMPLATE.format(run_id=target_run_id)
     scaler_mm_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=target_run_id)
     scaler_z_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=target_run_id)
 
@@ -128,6 +129,7 @@ def main():
                 train_cfg=cfg,
                 model_path=model_path,
                 scaler_y_path=scaler_y_path,
+                scaler_e_path=scaler_e_path,
                 scaler_mm_path=scaler_mm_path,
                 scaler_z_path=scaler_z_path,
                 device=f"cuda:{device_id}",
