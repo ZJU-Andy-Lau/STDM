@@ -7,8 +7,8 @@ def create_sliding_windows(data, y_raw, history_len, pred_len):
     samples = []
     total_len = len(data)
     for i in range(total_len - history_len - pred_len + 1):
-        history = data[i : i + history_len]
-        future = data[i + history_len : i + history_len + pred_len]
+        history = data[i : i + history_len].copy()
+        future = data[i + history_len : i + history_len + pred_len].copy()
         future[:, :, 0] = y_raw[i + history_len : i + history_len + pred_len]
         samples.append((i, history, future))
     return samples
@@ -51,8 +51,7 @@ class EVChargerDatasetV2(Dataset):
         static_features = features[0, :, cfg.HISTORY_FEATURES:].copy()
 
         target_col_original = dynamic_features[:, :, 0]
-        y_raw = target_col_original
-
+        y_raw = target_col_original.copy()
         if scaler_y is None:
             self.scaler_y = self._initialize_scaler_y(target_col_original)
         else:
@@ -86,6 +85,7 @@ class EVChargerDatasetV2(Dataset):
         static_features[:, :5] = mm_norm[0, :, -5:]
         static_features[:, 5:] = z_norm[0, :, :]
         self.static_features = torch.tensor(static_features, dtype=torch.float)
+
         self.samples = create_sliding_windows(dynamic_features, y_raw, history_len, pred_len)
         
         if scaler_e is None:
@@ -103,39 +103,99 @@ class EVChargerDatasetV2(Dataset):
             self._load_did_resources(did_policy_8am_path, did_policy_12am_path, did_beta_8am_path, did_beta_12am_path)
             self.did_ready = True
 
+    # def _fit_scaler_e_from_train_samples(self):
+    #     sum_ = 0.0
+    #     sumsq_ = 0.0
+    #     cnt_ = 0
+
+    #     for (start_idx, _, future) in self.samples:
+    #         # y_future_raw: (L, N, 1)
+    #         y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM].astype(np.float64)
+
+    #         # 获取 mu 用于计算残差，忽略 components
+    #         mu_future_raw, _ = self._build_mu_future(start_idx)
+    #         mu_future_raw = mu_future_raw.astype(np.float64)
+
+    #         e_raw = y_future_raw - mu_future_raw  # (L, N, 1)
+    #         x = e_raw.reshape(-1)                 # flatten
+
+    #         sum_ += x.sum()
+    #         sumsq_ += (x * x).sum()
+    #         cnt_ += x.size
+
+    #     mean = sum_ / cnt_
+    #     var = max(sumsq_ / cnt_ - mean * mean, 1e-12)
+    #     std = np.sqrt(var)
+
+    #     scaler = StandardScaler(with_mean=True, with_std=True)
+    #     # 手动填充必要字段，使 transform / inverse_transform 可用
+    #     scaler.mean_ = np.array([mean], dtype=np.float64)
+    #     scaler.var_ = np.array([var], dtype=np.float64)
+    #     scaler.scale_ = np.array([std], dtype=np.float64)
+    #     scaler.n_features_in_ = 1
+
+    #     return scaler
+    
     def _fit_scaler_e_from_train_samples(self):
-        sum_ = 0.0
-        sumsq_ = 0.0
+        """
+        使用训练样本中的 residual e = y - mu
+        拟合 MinMaxScaler，用于对 e 进行归一化 / 反归一化
+
+        注意：
+        - e 与 mu 必须处于同一尺度（通常是原始 occupancy）
+        - 该 scaler 只用于 residual，不影响 y / mu 的物理含义
+        """
+
+        sum_min = np.inf
+        sum_max = -np.inf
         cnt_ = 0
 
         for (start_idx, _, future) in self.samples:
-            # y_future_raw: (L, N, 1)
+            # future: (L, N, 1)
             y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM].astype(np.float64)
 
-            # 获取 mu 用于计算残差，忽略 components
-            mu_future_raw, _ = self._build_mu_future(start_idx)
-            mu_future_raw = mu_future_raw.astype(np.float64)
+            # mu_future: (L, N, 1)
+            mu_future_raw = self._build_mu_future(start_idx).astype(np.float64)
 
-            e_raw = y_future_raw - mu_future_raw  # (L, N, 1)
-            x = e_raw.reshape(-1)                 # flatten
+            # residual
+            e_raw = y_future_raw - mu_future_raw
+            x = e_raw.reshape(-1)
 
-            sum_ += x.sum()
-            sumsq_ += (x * x).sum()
+            # 安全性检查
+            if not np.all(np.isfinite(x)):
+                raise ValueError(
+                    "[scaler_e] 检测到 NaN / Inf，请检查 mu 或 y 是否异常"
+                )
+
+            sum_min = min(sum_min, x.min())
+            sum_max = max(sum_max, x.max())
             cnt_ += x.size
 
-        mean = sum_ / cnt_
-        var = max(sumsq_ / cnt_ - mean * mean, 1e-12)
-        std = np.sqrt(var)
+        if cnt_ == 0:
+            raise RuntimeError("[scaler_e] 未能收集到任何残差样本")
 
-        scaler = StandardScaler(with_mean=True, with_std=True)
-        # 手动填充必要字段，使 transform / inverse_transform 可用
-        scaler.mean_ = np.array([mean], dtype=np.float64)
-        scaler.var_ = np.array([var], dtype=np.float64)
-        scaler.scale_ = np.array([std], dtype=np.float64)
+        # 防止退化为常数
+        if abs(sum_max - sum_min) < 1e-8:
+            sum_max = sum_min + 1e-6
+
+        # 构造 MinMaxScaler
+        scaler = MinMaxScaler(feature_range=(-1.0, 1.0))
+        scale = 2.0 / (sum_max - sum_min)
+        min_ = -1.0 - sum_min * scale
+
+        scaler.scale_ = np.array([scale], dtype=np.float64)
+        scaler.min_ = np.array([min_], dtype=np.float64)
+
+        scaler.data_min_ = np.array([sum_min], dtype=np.float64)
+        scaler.data_max_ = np.array([sum_max], dtype=np.float64)
+        scaler.data_range_ = np.array([sum_max - sum_min], dtype=np.float64)
+
         scaler.n_features_in_ = 1
+        scaler.n_samples_seen_ = cnt_
 
         return scaler
-    
+
+
     def _initialize_scaler_y(self, data):
         if self.cfg.NORMALIZATION_TYPE == "minmax":
             scaler = MinMaxScaler(feature_range=(-1, 1))
