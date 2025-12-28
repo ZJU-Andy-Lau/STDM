@@ -152,10 +152,10 @@ class EVChargerDatasetV2(Dataset):
 
         for (start_idx, _, future) in self.samples:
             # future: (L, N, 1)
-            y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM].astype(np.float64)
+            y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM]
 
             # mu_future: (L, N, 1)
-            mu_future_raw = self._build_mu_future(start_idx).astype(np.float64)
+            mu_future_raw,_ = self._build_mu_future(start_idx)
 
             # residual
             e_raw = y_future_raw - mu_future_raw
