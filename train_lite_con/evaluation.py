@@ -26,9 +26,9 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 try:
-    from train_lite.config import EvalConfig
-    from train_lite.dataset import EVChargerDatasetV2
-    from train_lite.metrics import calculate_metrics, dm_test, print_metrics
+    from train_lite_con.config import EvalConfig
+    from train_lite_con.dataset import EVChargerDatasetV2
+    from train_lite_con.metrics import calculate_metrics, dm_test, print_metrics
 except ImportError:
     from config import EvalConfig
     from dataset import EVChargerDatasetV2
