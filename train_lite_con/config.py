@@ -88,13 +88,18 @@ class ConfigV2:
     DID_BETA_12_PATH='./urbanev/did_beta_12am.npz'
     TRAIN_DID_POLICY_8_PATH='./urbanev/did_policy_8_train.npz'
     VALID_DID_POLICY_8_PATH='./urbanev/did_policy_8_valid.npz'
-    TEST_DID_POLICY_8_PATH='./urbanev/did_policy_8_test.npz'
+    
     TRAIN_DID_POLICY_12_PATH='./urbanev/did_policy_12_train.npz'
     VALID_DID_POLICY_12_PATH='./urbanev/did_policy_12_valid.npz'
-    TEST_DID_POLICY_12_PATH='./urbanev/did_policy_12_test.npz'
+    
 
 class EvalConfig(ConfigV2):
     BATCH_SIZE = 8
     NUM_SAMPLES = 20
     SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    TEST_DID_POLICY_12_PATH='./urbanev/did_policy_12_test.npz'
+    TEST_DID_POLICY_8_PATH='./urbanev/did_policy_8_test.npz'
+    DID_BETA_8_PATH='./urbanev/did_beta_8am.npz'
+    DID_BETA_12_PATH='./urbanev/did_beta_12am.npz'
