@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from matplotlib import pyplot as plt
 
 def create_sliding_windows(data, y_raw, history_len, pred_len):
     samples = []
@@ -150,6 +151,8 @@ class EVChargerDatasetV2(Dataset):
         sum_max = -np.inf
         cnt_ = 0
 
+        all_e = []
+
         for (start_idx, _, future) in self.samples:
             # future: (L, N, 1)
             y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM]
@@ -161,6 +164,8 @@ class EVChargerDatasetV2(Dataset):
             e_raw = y_future_raw - mu_future_raw
             x = e_raw.reshape(-1)
 
+            all_e.append(x)
+
             # 安全性检查
             if not np.all(np.isfinite(x)):
                 raise ValueError(
@@ -170,6 +175,11 @@ class EVChargerDatasetV2(Dataset):
             sum_min = min(sum_min, x.min())
             sum_max = max(sum_max, x.max())
             cnt_ += x.size
+        
+        all_e = np.concatenate(all_e)
+        print(f"e min:{all_e.min()} \t e max:{all_e.max()} \t e mean:{all_e.mean()} \t e std:{all_e.std()}")
+        plt.hist(all_e,1000)
+        plt.savefig('./results/e_raw_hist.png')
 
         if cnt_ == 0:
             raise RuntimeError("[scaler_e] 未能收集到任何残差样本")
