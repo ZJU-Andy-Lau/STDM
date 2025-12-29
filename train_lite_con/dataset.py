@@ -153,9 +153,9 @@ class EVChargerDatasetV2(Dataset):
         sum_max = -np.inf
         cnt_ = 0
 
-        all_e = []
-        all_y = []
-        all_mu = []
+        # all_e = []
+        # all_y = []
+        # all_mu = []
 
         for (start_idx, _, future) in self.samples:
             # future: (L, N, 1)
@@ -168,9 +168,9 @@ class EVChargerDatasetV2(Dataset):
             e_raw = y_future_raw - mu_future_raw
             x = e_raw.reshape(-1)
 
-            all_e.append(x)
-            all_y.append(y_future_raw.reshape(-1))
-            all_mu.append(mu_future_raw.reshape(-1))
+            # all_e.append(x)
+            # all_y.append(y_future_raw.reshape(-1))
+            # all_mu.append(mu_future_raw.reshape(-1))
 
             # 安全性检查
             if not np.all(np.isfinite(x)):
@@ -182,23 +182,23 @@ class EVChargerDatasetV2(Dataset):
             sum_max = max(sum_max, x.max())
             cnt_ += x.size
 
-        all_e = np.concatenate(all_e)
-        all_y = np.concatenate(all_y)
-        all_mu = np.concatenate(all_mu)
+        # all_e = np.concatenate(all_e)
+        # all_y = np.concatenate(all_y)
+        # all_mu = np.concatenate(all_mu)
             
-        print(f"e min:{all_e.min()} \t e max:{all_e.max()} \t e mean:{all_e.mean()} \t e std:{all_e.std()}")
-        print(f"y min:{all_y.min()} \t y max:{all_y.max()} \t y mean:{all_y.mean()} \t y std:{all_y.std()}")
-        print(f"mu min:{all_mu.min()} \t mu max:{all_mu.max()} \t mu mean:{all_mu.mean()} \t mu std:{all_mu.std()}")
-        plt.hist(all_e,100)
-        plt.savefig('./results/e_raw_hist.png')
-        plt.close()
-        plt.hist(all_y,100)
-        plt.savefig('./results/y_raw_hist.png')
-        plt.close()
-        plt.hist(all_mu,100)
-        plt.savefig('./results/mu_raw_hist.png')
-        plt.close()
-        exit()
+        # print(f"e min:{all_e.min()} \t e max:{all_e.max()} \t e mean:{all_e.mean()} \t e std:{all_e.std()}")
+        # print(f"y min:{all_y.min()} \t y max:{all_y.max()} \t y mean:{all_y.mean()} \t y std:{all_y.std()}")
+        # print(f"mu min:{all_mu.min()} \t mu max:{all_mu.max()} \t mu mean:{all_mu.mean()} \t mu std:{all_mu.std()}")
+        # plt.hist(all_e,100)
+        # plt.savefig('./results/e_raw_hist.png')
+        # plt.close()
+        # plt.hist(all_y,100)
+        # plt.savefig('./results/y_raw_hist.png')
+        # plt.close()
+        # plt.hist(all_mu,100)
+        # plt.savefig('./results/mu_raw_hist.png')
+        # plt.close()
+        # exit()
 
         if cnt_ == 0:
             raise RuntimeError("[scaler_e] 未能收集到任何残差样本")
@@ -394,7 +394,7 @@ class EVChargerDatasetV2(Dataset):
                 mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
         
         mu[:, :, 0] = mu_comps[:, :, 4]
-        print(f"mu:\n{mu}\nmu_comps:\n{mu_comps}")
+        # print(f"mu:\n{mu}\nmu_comps:\n{mu_comps}")
         return mu, mu_comps
 
     def __len__(self):
