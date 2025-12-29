@@ -404,7 +404,7 @@ class EVChargerDatasetV2(Dataset):
 
         future_known_c = torch.cat([future_known_c, mu_comps], dim=-1)
 
-        return history_c, self.static_features, target_e0, mu_future, future_known_c, idx, start_idx
+        return history_c, self.static_features, target_e0, mu_future, future_known_c, idx, start_idx, future_x0
 
 
     def get_scaler(self):

@@ -55,9 +55,9 @@ def periodic_evaluate_mae(model, loader, scaler_e, adj_tensor, cfg, device):
 
     all_predictions_list = []
     all_true_list = []
-    for (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx) in progress_bar:
-        tensors = [d.to(device) for d in (history_c, static_c, target_e0, mu_future, future_known_c)]
-        history_c, static_c, target_e0, mu_future, future_known_c = tensors
+    for (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx, future_x0) in progress_bar:
+        tensors = [d.to(device) for d in (history_c, static_c, target_e0, mu_future, future_known_c, future_x0)]
+        history_c, static_c, target_e0, mu_future, future_known_c, future_x0 = tensors
         
         generated_samples = []
         for _ in range(cfg.EVAL_ON_VAL_SAMPLES):
@@ -75,20 +75,22 @@ def periodic_evaluate_mae(model, loader, scaler_e, adj_tensor, cfg, device):
         stacked = torch.stack(generated_samples, dim=0)                 # (S,B,N,L,1)
         e_norm_pred = torch.median(stacked, dim=0).values       # (B,N,L,1)
 
-        e_norm_true = target_e0.permute(0,2,1,3)                # (B,N,L,1)
+        # e_norm_true = target_e0.permute(0,2,1,3)                # (B,N,L,1)
         mu_raw      = mu_future.permute(0,2,1,3)                # (B,N,L,1)
+        future_x0   = future_x0.permute(0,2,1,3)                 # (B,N,L,1)
 
         # === 关键：用 scaler_e 反归一化 e，再加 mu ===
         e_pred = e_norm_pred.detach().cpu().numpy()
-        e_true = e_norm_true.detach().cpu().numpy()
+        # e_true = e_norm_true.detach().cpu().numpy()
         mu = mu_raw.detach().cpu().numpy()
+        future_x0 = future_x0.detach().cpu().numpy()
 
         if scaler_e is not None:
             e_pred = scaler_e.inverse_transform(e_pred.reshape(-1,1)).reshape(e_pred.shape)
-            e_true = scaler_e.inverse_transform(e_true.reshape(-1,1)).reshape(e_true.shape)
+            # e_true = scaler_e.inverse_transform(e_true.reshape(-1,1)).reshape(e_true.shape)
 
         y_pred = e_pred + mu
-        y_true = e_true + mu
+        y_true = future_x0
         y_pred = np.clip(y_pred, 0.0, 1.0) 
 
         all_predictions_list.append(y_pred)
@@ -152,21 +154,23 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
     test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
-    all_predictions_list, all_samples_list, all_true_list, all_idx_list,all_mu_list = [], [], [], [], []
+    all_predictions_list, all_samples_list, all_true_list, all_idx_list,all_mu_list, all_future_x0_list = [], [], [], [], [], []
 
     disable_tqdm = (dist.is_initialized() and dist.get_rank() != 0)
     with torch.no_grad(), amp.autocast():
         for tensors in tqdm(test_dataloader, desc="Evaluating", disable=disable_tqdm):
-            history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx = tensors
+            history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx, future_x0 = tensors
             history_c = history_c.to(cfg.DEVICE)
             static_c = static_c.to(cfg.DEVICE)
             target_e0 = target_e0.to(cfg.DEVICE)
             mu_future = mu_future.to(cfg.DEVICE)
             future_known_c = future_known_c.to(cfg.DEVICE)
+            future_x0 = future_x0.to(cfg.DEVICE)
 
             all_true_list.append(target_e0.permute(0, 2, 1, 3).cpu().numpy())
             all_idx_list.append(idx.cpu().numpy()) 
             all_mu_list.append(mu_future.permute(0, 2, 1, 3).cpu().numpy())
+            all_future_x0_list.append(future_x0.permute(0, 2, 1, 3).cpu().numpy())
 
             # [修改] 使用 adj_tensor
             generated_samples = []
@@ -183,12 +187,9 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
             stacked_samples = torch.stack(generated_samples, dim=0)
             median_prediction = torch.median(stacked_samples, dim=0).values
 
-            denorm_pred, denorm_samples = median_prediction.cpu().numpy(), stacked_samples.cpu().numpy()
             all_predictions_list.append(median_prediction.cpu().numpy())
             all_samples_list.append(stacked_samples.cpu().numpy())
 
-    all_predictions = np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1)
-    all_samples = np.concatenate(all_samples_list, axis=1).squeeze(-1).transpose(1, 0, 3, 2)
 
     print(f"Rank {rank} :idx list:{all_idx_list}")
 
@@ -198,11 +199,13 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         local_true = np.empty((0, cfg.PRED_LEN, cfg.NUM_NODES, cfg.TARGET_FEAT_DIM), dtype=np.float32)
         local_mu = np.empty((0, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM), dtype=np.float32)  # (0,N,L,1)
         local_idx = np.empty((0,), dtype=np.int64)
+        local_future_x0 = np.empty((0, cfg.NUM_NODES, cfg.PRED_LEN, cfg.TARGET_FEAT_DIM), dtype=np.float32)
     else:
         local_predictions = np.concatenate(all_predictions_list, axis=0)
         local_samples = np.concatenate(all_samples_list, axis=1)
         local_true = np.concatenate(all_true_list, axis=0)
         local_mu = np.concatenate(all_mu_list, axis=0)
+        local_future_x0 = np.concatenate(all_future_x0_list, axis=0)
         local_idx = np.concatenate(all_idx_list, axis=0) 
 
     gathered_preds = [None] * world_size
@@ -210,12 +213,14 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
     gathered_true = [None] * world_size
     gathered_idx = [None] * world_size
     gathered_mu = [None] * world_size
+    gathered_future_x0 = [None] * world_size
 
     dist.gather_object(local_predictions, gathered_preds if rank == 0 else None, dst=0)
     dist.gather_object(local_samples, gathered_samples if rank == 0 else None, dst=0)
     dist.gather_object(local_true, gathered_true if rank == 0 else None, dst=0)
     dist.gather_object(local_mu, gathered_mu if rank == 0 else None, dst=0)
     dist.gather_object(local_idx, gathered_idx if rank == 0 else None, dst=0)
+    dist.gather_object(local_future_x0, gathered_future_x0 if rank == 0 else None, dst=0)
     
     if rank == 0:
         all_predictions_norm = np.concatenate(gathered_preds, axis=0)
@@ -223,6 +228,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         all_true_norm = np.concatenate(gathered_true, axis=0)
         all_mu_raw = np.concatenate(gathered_mu, axis=0)
         all_idx = np.concatenate(gathered_idx, axis=0)
+        all_future_x0 = np.concatenate(gathered_future_x0, axis=0)
         print(f"gather index:{all_idx}")
 
         order = np.argsort(all_idx)
@@ -231,6 +237,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         all_true_norm = all_true_norm[order]
         all_samples_norm = all_samples_norm[:, order]
         all_mu_raw = all_mu_raw[order]
+        all_future_x0 = all_future_x0[order]
 
         if scaler_e:
             e_pred = scaler_e.inverse_transform(all_predictions_norm.reshape(-1, 1)).reshape(all_predictions_norm.shape)
@@ -242,15 +249,16 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
             e_samp = all_samples_norm
 
         y_pred = e_pred + all_mu_raw
-        y_true = e_true + all_mu_raw
+        # y_true = e_true + all_mu_raw
         y_samp = e_samp + all_mu_raw[None, ...]
 
         y_pred = np.clip(y_pred, 0.0, 1.0)
-        y_true = np.clip(y_true, 0.0, 1.0)
+        # y_true = np.clip(y_true, 0.0, 1.0)
 
         y_pred = y_pred.squeeze(-1).transpose(0, 2, 1)      # (B, L, N)
-        y_true = y_true.squeeze(-1).transpose(0, 2, 1)      # (B, L, N)
+        # y_true = y_true.squeeze(-1).transpose(0, 2, 1)      # (B, L, N)
         y_samp = y_samp.squeeze(-1).transpose(1, 0, 3, 2)   # (B, S, L, N)
+        y_true = all_future_x0.squeeze(-1).transpose(0, 2, 1)  # (B, L, N)
 
         try:
             all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")

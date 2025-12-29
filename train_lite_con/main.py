@@ -242,7 +242,7 @@ def train():
         batch_loss_tracker = 0.0
         optimizer.zero_grad()
 
-        for i, (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx) in enumerate(progress_bar):
+        for i, (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx,future_x0) in enumerate(progress_bar):
             # 判断是否是梯度更新步
             is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
             
