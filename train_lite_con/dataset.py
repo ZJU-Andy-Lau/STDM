@@ -43,7 +43,18 @@ class EVChargerDatasetV2(Dataset):
         self.did_ready = False
         self.policy = None     # dict: keys -> (T, N)
         self.beta_8 = None     
-        self.beta_12 = None    
+        self.beta_12 = None
+
+        # ============================================================
+        # DID 资源加载（可选）
+        # 约定：
+        #  did_beta_npz_path: 保存 beta 曲线（分钟网格）+ 预先插值后的 12 步也可
+        #  did_policy_npz_path: 保存每个时间点、每个节点的政策强度张量（已对齐到 features 的时间轴）
+        # ============================================================
+
+        if self.enable_did and did_policy_8am_path and did_policy_12am_path and did_beta_8am_path and did_beta_12am_path:
+            self._load_did_resources(did_policy_8am_path, did_policy_12am_path, did_beta_8am_path, did_beta_12am_path)
+            self.did_ready = True    
 
         minmax_features = features[:, :, cfg.HISTORY_FEATURES-4:cfg.HISTORY_FEATURES+5].copy()
         zscore_features = features[:, :, cfg.HISTORY_FEATURES+5:].copy()
@@ -93,16 +104,7 @@ class EVChargerDatasetV2(Dataset):
             self.scaler_e = self._initialize_scaler_e()
         else:
             self.scaler_e = scaler_e
-        # ============================================================
-        # DID 资源加载（可选）
-        # 约定：
-        #  did_beta_npz_path: 保存 beta 曲线（分钟网格）+ 预先插值后的 12 步也可
-        #  did_policy_npz_path: 保存每个时间点、每个节点的政策强度张量（已对齐到 features 的时间轴）
-        # ============================================================
-
-        if self.enable_did and did_policy_8am_path and did_policy_12am_path and did_beta_8am_path and did_beta_12am_path:
-            self._load_did_resources(did_policy_8am_path, did_policy_12am_path, did_beta_8am_path, did_beta_12am_path)
-            self.did_ready = True
+        
 
     # def _fit_scaler_e_from_train_samples(self):
     #     sum_ = 0.0
