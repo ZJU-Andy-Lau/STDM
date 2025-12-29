@@ -179,11 +179,12 @@ class EVChargerDatasetV2(Dataset):
             sum_min = min(sum_min, x.min())
             sum_max = max(sum_max, x.max())
             cnt_ += x.size
-        
+            
+        all_e = np.concatenate(all_e)
+        all_y = np.concatenate(all_y)
+        all_mu = np.concatenate(all_mu)
         if all_mu.max() > 0:
-            all_e = np.concatenate(all_e)
-            all_y = np.concatenate(all_y)
-            all_mu = np.concatenate(all_mu)
+            
             print(f"e min:{all_e.min()} \t e max:{all_e.max()} \t e mean:{all_e.mean()} \t e std:{all_e.std()}")
             print(f"y min:{all_y.min()} \t y max:{all_y.max()} \t y mean:{all_y.mean()} \t y std:{all_y.std()}")
             print(f"mu min:{all_mu.min()} \t mu max:{all_mu.max()} \t mu mean:{all_mu.mean()} \t mu std:{all_mu.std()}")
