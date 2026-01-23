@@ -85,11 +85,6 @@ def main():
     # 定义要测试的模型列表
     models_to_test = [
         {
-            "name": "2nd Best Val Loss Model",
-            "key": "second_best_val",
-            "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="second_best")
-        },
-        {
             "name": "Best Val MAE Model",
             "key": "best",
             "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="mae_best")
@@ -103,6 +98,11 @@ def main():
             "name": "Best Val Loss Model",
             "key": "best_val",
             "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="best")
+        },        
+        {
+            "name": "2nd Best Val Loss Model",
+            "key": "second_best_val",
+            "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="second_best")
         },
         
     ]

@@ -1,0 +1,2 @@
+epoch,avg_train_loss,avg_val_loss,lr,avg_val_mae
+1,0.21752578020095825,0.2453128546476364,0.0001,

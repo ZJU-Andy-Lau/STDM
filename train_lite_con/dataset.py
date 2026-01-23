@@ -318,10 +318,10 @@ class EVChargerDatasetV2(Dataset):
 
                 return beta_dict
 
-            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0, 1]
+            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0]
             )
 
-            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
+            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[-1, 0, 1])
         
         load_one_beta(did_beta_8am_path, did_beta_12am_path)
 
@@ -366,7 +366,6 @@ class EVChargerDatasetV2(Dataset):
             r8 = rel8[k]
             if r8 in self.beta_8:
                 b = self.beta_8[r8]
-                
                 term_own = b[0] * D8 * PSM8
                 term_amp = b[1] * D8 * dp8 * PSM8
                 term_ec  = b[2] * ec8 * PSM8
@@ -394,7 +393,7 @@ class EVChargerDatasetV2(Dataset):
                 mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
         
         mu[:, :, 0] = mu_comps[:, :, 4]
-        # print(f"mu:\n{mu}\nmu_comps:\n{mu_comps}")
+
         return mu, mu_comps
 
     def __len__(self):
