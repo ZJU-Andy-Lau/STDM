@@ -138,8 +138,10 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.use_film = context_dim > 0
         if self.use_film:
             self.film_layer = FiLMLayer(channels, context_dim)
+            self.context_bias = nn.Linear(context_dim, channels)
         else:
             self.film_layer = None
+            self.context_bias = None
         self.ffn = nn.Sequential(
             nn.Linear(channels, channels * 4),
             nn.GELU(),
@@ -161,8 +163,9 @@ class SpatioTemporalTransformerBlock(nn.Module):
         def _inner_forward(x, context, adj, attn_mask):
             x_res = x
             if self.use_film and context is not None:
-                x = self.film_layer(x, context)
-            
+                B, N, L, C = x.shape
+                bias = self.context_bias(context).view(B, N, 1, C)
+                x = x + bias
             x_spatial_res = x
             x_norm_spatial = self.spatial_norm(x)
             
