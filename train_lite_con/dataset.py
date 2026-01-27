@@ -4,13 +4,12 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from matplotlib import pyplot as plt
 
-def create_sliding_windows(data, y_raw, history_len, pred_len):
+def create_sliding_windows(data, history_len, pred_len):
     samples = []
     total_len = len(data)
     for i in range(total_len - history_len - pred_len + 1):
         history = data[i : i + history_len].copy()
         future = data[i + history_len : i + history_len + pred_len].copy()
-        future[:, :, 0] = y_raw[i + history_len : i + history_len + pred_len]
         samples.append((i, history, future))
     return samples
 
@@ -22,15 +21,14 @@ class EVChargerDatasetV2(Dataset):
     - 输出:
         history_c       : (Lh, N, HISTORY_FEATURES)
         static_features : (N, STATIC_FEATURES)
-        target_e0       : (Lf, N, TARGET_FEAT_DIM)   = future_x0 - mu_future
-        mu_future       : (Lf, N, TARGET_FEAT_DIM)
         future_known_c  : (Lf, N, FUTURE_KNOWN_FEAT_DIM)
         idx             : int
         start_idx       : int  (新增)
-    若未提供 DID 资源，则 mu_future=0，target_e0=future_x0
+        future_x0       : (Lf, N, TARGET_FEAT_DIM)
+    若未提供 DID 资源，则 mu_future / mu_comps 仍为 0，但只用于特征拼接
     """
     def __init__(self, features, history_len, pred_len, cfg,
-                scaler_y=None, scaler_e=None, scaler_mm=None, scaler_z=None,
+                scaler_y=None, scaler_mm=None, scaler_z=None,
                 did_policy_8am_path=None,
                 did_policy_12am_path=None,
                 did_beta_8am_path=None,
@@ -63,7 +61,6 @@ class EVChargerDatasetV2(Dataset):
         static_features = features[0, :, cfg.HISTORY_FEATURES:].copy()
 
         target_col_original = dynamic_features[:, :, 0]
-        y_raw = target_col_original.copy()
         if scaler_y is None:
             self.scaler_y = self._initialize_scaler_y(target_col_original)
         else:
@@ -98,132 +95,8 @@ class EVChargerDatasetV2(Dataset):
         static_features[:, 5:] = z_norm[0, :, :]
         self.static_features = torch.tensor(static_features, dtype=torch.float)
 
-        self.samples = create_sliding_windows(dynamic_features, y_raw, history_len, pred_len)
+        self.samples = create_sliding_windows(dynamic_features, history_len, pred_len)
         
-        if scaler_e is None:
-            self.scaler_e = self._initialize_scaler_e()
-        else:
-            self.scaler_e = scaler_e
-        
-
-    # def _fit_scaler_e_from_train_samples(self):
-    #     sum_ = 0.0
-    #     sumsq_ = 0.0
-    #     cnt_ = 0
-
-    #     for (start_idx, _, future) in self.samples:
-    #         # y_future_raw: (L, N, 1)
-    #         y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM].astype(np.float64)
-
-    #         # 获取 mu 用于计算残差，忽略 components
-    #         mu_future_raw, _ = self._build_mu_future(start_idx)
-    #         mu_future_raw = mu_future_raw.astype(np.float64)
-
-    #         e_raw = y_future_raw - mu_future_raw  # (L, N, 1)
-    #         x = e_raw.reshape(-1)                 # flatten
-
-    #         sum_ += x.sum()
-    #         sumsq_ += (x * x).sum()
-    #         cnt_ += x.size
-
-    #     mean = sum_ / cnt_
-    #     var = max(sumsq_ / cnt_ - mean * mean, 1e-12)
-    #     std = np.sqrt(var)
-
-    #     scaler = StandardScaler(with_mean=True, with_std=True)
-    #     # 手动填充必要字段，使 transform / inverse_transform 可用
-    #     scaler.mean_ = np.array([mean], dtype=np.float64)
-    #     scaler.var_ = np.array([var], dtype=np.float64)
-    #     scaler.scale_ = np.array([std], dtype=np.float64)
-    #     scaler.n_features_in_ = 1
-
-    #     return scaler
-    
-    def _fit_scaler_e_from_train_samples(self):
-        """
-        使用训练样本中的 residual e = y - mu
-        拟合 MinMaxScaler，用于对 e 进行归一化 / 反归一化
-
-        注意：
-        - e 与 mu 必须处于同一尺度（通常是原始 occupancy）
-        - 该 scaler 只用于 residual，不影响 y / mu 的物理含义
-        """
-
-        sum_min = np.inf
-        sum_max = -np.inf
-        cnt_ = 0
-
-        # all_e = []
-        # all_y = []
-        # all_mu = []
-
-        for (start_idx, _, future) in self.samples:
-            # future: (L, N, 1)
-            y_future_raw = future[:, :, :self.cfg.TARGET_FEAT_DIM]
-
-            # mu_future: (L, N, 1)
-            mu_future_raw,_ = self._build_mu_future(start_idx)
-
-            # residual
-            e_raw = y_future_raw - mu_future_raw
-            x = e_raw.reshape(-1)
-
-            # all_e.append(x)
-            # all_y.append(y_future_raw.reshape(-1))
-            # all_mu.append(mu_future_raw.reshape(-1))
-
-            # 安全性检查
-            if not np.all(np.isfinite(x)):
-                raise ValueError(
-                    "[scaler_e] 检测到 NaN / Inf，请检查 mu 或 y 是否异常"
-                )
-
-            sum_min = min(sum_min, x.min())
-            sum_max = max(sum_max, x.max())
-            cnt_ += x.size
-
-        # all_e = np.concatenate(all_e)
-        # all_y = np.concatenate(all_y)
-        # all_mu = np.concatenate(all_mu)
-            
-        # print(f"e min:{all_e.min()} \t e max:{all_e.max()} \t e mean:{all_e.mean()} \t e std:{all_e.std()}")
-        # print(f"y min:{all_y.min()} \t y max:{all_y.max()} \t y mean:{all_y.mean()} \t y std:{all_y.std()}")
-        # print(f"mu min:{all_mu.min()} \t mu max:{all_mu.max()} \t mu mean:{all_mu.mean()} \t mu std:{all_mu.std()}")
-        # plt.hist(all_e,100)
-        # plt.savefig('./results/e_raw_hist.png')
-        # plt.close()
-        # plt.hist(all_y,100)
-        # plt.savefig('./results/y_raw_hist.png')
-        # plt.close()
-        # plt.hist(all_mu,100)
-        # plt.savefig('./results/mu_raw_hist.png')
-        # plt.close()
-        # exit()
-
-        if cnt_ == 0:
-            raise RuntimeError("[scaler_e] 未能收集到任何残差样本")
-
-        # 防止退化为常数
-        if abs(sum_max - sum_min) < 1e-8:
-            sum_max = sum_min + 1e-6
-
-        # 构造 MinMaxScaler
-        scaler = MinMaxScaler(feature_range=(-1.0, 1.0))
-        scale = 2.0 / (sum_max - sum_min)
-        min_ = -1.0 - sum_min * scale
-
-        scaler.scale_ = np.array([scale], dtype=np.float64)
-        scaler.min_ = np.array([min_], dtype=np.float64)
-
-        scaler.data_min_ = np.array([sum_min], dtype=np.float64)
-        scaler.data_max_ = np.array([sum_max], dtype=np.float64)
-        scaler.data_range_ = np.array([sum_max - sum_min], dtype=np.float64)
-
-        scaler.n_features_in_ = 1
-        scaler.n_samples_seen_ = cnt_
-
-        return scaler
-
 
     def _initialize_scaler_y(self, data):
         if self.cfg.NORMALIZATION_TYPE == "minmax":
@@ -232,10 +105,6 @@ class EVChargerDatasetV2(Dataset):
             scaler = StandardScaler()
         else: return None
         scaler.fit(data.reshape(-1, 1))
-        return scaler
-    
-    def _initialize_scaler_e(self):
-        scaler=self._fit_scaler_e_from_train_samples()
         return scaler
     
     def _initialize_scaler_mm(self, data):
@@ -318,10 +187,10 @@ class EVChargerDatasetV2(Dataset):
 
                 return beta_dict
 
-            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0]
+            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0, 1]
             )
 
-            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[-1, 0, 1])
+            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
         
         load_one_beta(did_beta_8am_path, did_beta_12am_path)
 
@@ -366,6 +235,7 @@ class EVChargerDatasetV2(Dataset):
             r8 = rel8[k]
             if r8 in self.beta_8:
                 b = self.beta_8[r8]
+                
                 term_own = b[0] * D8 * PSM8
                 term_amp = b[1] * D8 * dp8 * PSM8
                 term_ec  = b[2] * ec8 * PSM8
@@ -393,7 +263,7 @@ class EVChargerDatasetV2(Dataset):
                 mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
         
         mu[:, :, 0] = mu_comps[:, :, 4]
-
+        # print(f"mu:\n{mu}\nmu_comps:\n{mu_comps}")
         return mu, mu_comps
 
     def __len__(self):
@@ -404,7 +274,7 @@ class EVChargerDatasetV2(Dataset):
 
         history_c = torch.tensor(history, dtype=torch.float)
 
-        future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float) 
+        future_x0 = torch.tensor(future[:, :, :self.cfg.TARGET_FEAT_DIM], dtype=torch.float)
 
         # 计算切片索引，需排除新增的DID维度，使用原始的13维来定位
         orig_future_known_dim = self.cfg.FUTURE_KNOWN_FEAT_DIM - self.cfg.DID_FEAT_DIM
@@ -415,26 +285,18 @@ class EVChargerDatasetV2(Dataset):
             dtype=torch.float
         )
 
-        mu_future_np, mu_comps_np = self._build_mu_future(start_idx)
-        mu_future = torch.tensor(mu_future_np, dtype=torch.float)
-        
-        mu_comps = torch.tensor(mu_comps_np, dtype=torch.float)
-        mu_comps = mu_comps / (self.scaler_e.scale_[0] + 1e-8) #归一化did特征
+        _, mu_comps_np = self._build_mu_future(start_idx)
 
-        e_raw = future_x0 - mu_future
-        e_raw_np = e_raw.numpy().reshape(-1, 1)
+        if self.cfg.NORMALIZATION_TYPE != "none" and self.scaler_y is not None:
+            mu_comps_norm = self.scaler_y.transform(mu_comps_np.reshape(-1, 1)).reshape(mu_comps_np.shape)
+        else:
+            mu_comps_norm = mu_comps_np
 
-        e_norm_np = self.scaler_e.transform(e_raw_np)
-
-        target_e0 = torch.tensor(
-            e_norm_np.reshape(e_raw.shape),
-            dtype=torch.float
-        )
-
+        mu_comps = torch.tensor(mu_comps_norm, dtype=torch.float)
         future_known_c = torch.cat([future_known_c, mu_comps], dim=-1)
 
-        return history_c, self.static_features, target_e0, mu_future, future_known_c, idx, start_idx, future_x0
+        return history_c, self.static_features, future_x0, future_known_c, idx, start_idx
 
 
     def get_scaler(self):
-        return self.scaler_y, self.scaler_e, self.scaler_mm, self.scaler_z
+        return self.scaler_y, self.scaler_mm, self.scaler_z

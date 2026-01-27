@@ -78,7 +78,6 @@ def train():
         model_save_path_mae_second_best = cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID, rank="mae_second_best")
 
         scaler_y_save_path = cfg.SCALER_Y_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
-        scaler_e_save_path = cfg.SCALER_E_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
         scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
         scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
 
@@ -98,7 +97,6 @@ def train():
         if rank != 0: 
             cfg.RUN_ID = run_id_list[0]
             scaler_y_save_path = cfg.SCALER_Y_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
-            scaler_e_save_path = cfg.SCALER_E_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
             scaler_mm_save_path = cfg.SCALER_MM_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
             scaler_z_save_path = cfg.SCALER_Z_SAVE_PATH_TEMPLATE.format(run_id=cfg.RUN_ID)
 
@@ -153,25 +151,22 @@ def train():
     if rank == 0:
         print(f"Train Dataset Size: {len(train_dataset)}, Steps per Epoch: {len(train_dataloader)}")
         if cfg.NORMALIZATION_TYPE != "none":
-            scaler_y, scaler_e, scaler_mm, scaler_z = train_dataset.get_scaler()
+            scaler_y, scaler_mm, scaler_z = train_dataset.get_scaler()
             joblib.dump(scaler_y, scaler_y_save_path)
-            joblib.dump(scaler_e, scaler_e_save_path)
             joblib.dump(scaler_mm, scaler_mm_save_path)
             joblib.dump(scaler_z, scaler_z_save_path)
     if dist.is_initialized():
         dist.barrier()
 
     train_y_scaler = joblib.load(scaler_y_save_path) if os.path.exists(scaler_y_save_path) else None
-    train_e_scaler = joblib.load(scaler_e_save_path) if os.path.exists(scaler_e_save_path) else None
     train_mm_scaler = joblib.load(scaler_mm_save_path) if os.path.exists(scaler_mm_save_path) else None
     train_z_scaler = joblib.load(scaler_z_save_path) if os.path.exists(scaler_z_save_path) else None
 
     val_dataset = EVChargerDatasetV2(val_features, 
                                      cfg.HISTORY_LEN, 
                                      cfg.PRED_LEN, cfg, 
-                                     scaler_y=train_y_scaler, 
-                                     scaler_e=train_e_scaler, 
-                                     scaler_mm=train_mm_scaler, 
+                                     scaler_y=train_y_scaler,
+                                     scaler_mm=train_mm_scaler,
                                      scaler_z=train_z_scaler,
                                      did_beta_8am_path=did_bate_8_path,
                                      did_beta_12am_path=did_bate_12_path,
@@ -242,7 +237,7 @@ def train():
         batch_loss_tracker = 0.0
         optimizer.zero_grad()
 
-        for i, (history_c, static_c, target_e0, mu_future, future_known_c, idx, start_idx,future_x0) in enumerate(progress_bar):
+        for i, (history_c, static_c, future_x0, future_known_c, idx, start_idx) in enumerate(progress_bar):
             # 判断是否是梯度更新步
             is_grad_update_step = ((i + 1) % cfg.ACCUMULATION_STEPS == 0) or ((i + 1) == len(train_dataloader))
             
@@ -260,8 +255,7 @@ def train():
                 # 1. 数据上 GPU 
                 hist_batch = history_c.to(device_id)
                 stat_batch = static_c.to(device_id)
-                future_batch = target_e0.to(device_id)   # residual ground truth
-                mu_batch     = mu_future.to(device_id)   # 如果你不在训练loss里用mu，也可以不to(device)；但建议to以便后续扩展
+                future_batch = future_x0.to(device_id)
                 known_batch  = future_known_c.to(device_id)
                 
                 B = hist_batch.shape[0]
@@ -407,17 +401,17 @@ def train():
         
         with torch.no_grad():
             for tensors in val_dataloader:
-                history_c, static_c, target_e0, mu_future, future_known_c = [d.to(device_id) for d in tensors[:5]]
+                history_c, static_c, future_x0, future_known_c = [d.to(device_id) for d in tensors[:4]]
                 with amp.autocast():
                     # future_x0: (B, L, N, C) -> 需要调整为 (B, N, L, C)
-                    target_e0 = target_e0.permute(0, 2, 1, 3)
+                    future_x0 = future_x0.permute(0, 2, 1, 3)
                     # history_c: (B, L, N, C) -> (B, N, L, C)
                     history_c = history_c.permute(0, 2, 1, 3)
                     # future_known_c: (B, L, N, C) -> (B, N, L, C)
                     future_known_c = future_known_c.permute(0, 2, 1, 3)
                     
-                    b = target_e0.shape[0]
-                    noise = torch.randn_like(target_e0) # (B, N, L, C)
+                    b = future_x0.shape[0]
+                    noise = torch.randn_like(future_x0) # (B, N, L, C)
                     
                     k = torch.randint(0, cfg.T, (b,), device=device_id).long()
                     
@@ -428,7 +422,7 @@ def train():
                         sqrt_alpha = ddp_model.sqrt_alphas_cumprod[k].view(b, 1, 1, 1)
                         sqrt_one_minus = ddp_model.sqrt_one_minus_alphas_cumprod[k].view(b, 1, 1, 1)
 
-                    x_k = sqrt_alpha * target_e0 + sqrt_one_minus * noise
+                    x_k = sqrt_alpha * future_x0 + sqrt_one_minus * noise
                     
                     pred_noise = ddp_model(x_k, k, history_c, static_c, future_known_c, adj_tensor)
                     val_loss = nn.MSELoss()(pred_noise, noise)
@@ -493,7 +487,7 @@ def train():
             local_pred, local_true = periodic_evaluate_mae(
                 model_to_eval, 
                 val_eval_loader,
-                train_e_scaler,
+                train_y_scaler,
                 adj_tensor,
                 cfg,
                 device_id
@@ -558,7 +552,7 @@ def train():
     def run_eval(path, key_name, desc):
         if path and os.path.exists(path):
             if rank == 0: print(f"\n[ALL GPUS] Evaluating {desc}: {os.path.basename(path)}")
-            metrics = evaluate_model(cfg, path, scaler_y_save_path, scaler_e_save_path, scaler_mm_save_path, scaler_z_save_path, device=f"cuda:{device_id}", rank=rank, world_size=world_size, key=key_name)
+            metrics = evaluate_model(cfg, path, scaler_y_save_path, scaler_mm_save_path, scaler_z_save_path, device=f"cuda:{device_id}", rank=rank, world_size=world_size, key=key_name)
             if rank == 0: print_metrics(metrics)
 
     run_eval(best_model_path_for_val_synced, 'best_val', 'BEST VAL model')

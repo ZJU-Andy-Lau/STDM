@@ -60,8 +60,8 @@ def verify_did():
     for idx in indices:
         # 获取样本
         # future_known_c shape: (Lf, N, 18)
-        # 最后的 5 个通道是 [own, amp, ec, tc, total]
-        _, _, _, _, future_known_c, _, start_idx = dataset[idx]
+        # 最后的 5 个通是 [own, amp, ec, tc, total]
+        _, _, _, future_known_c, _, start_idx = dataset[idx]
         
         # 提取 DID 特征部分
         did_feats = future_known_c[:, :, -5:] # (12, 275, 5)
