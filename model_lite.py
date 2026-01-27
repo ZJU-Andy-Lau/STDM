@@ -137,10 +137,10 @@ class SpatioTemporalTransformerBlock(nn.Module):
         self.temporal_norm = nn.LayerNorm(channels)
         self.use_film = context_dim > 0
         if self.use_film:
-            self.film_layer = FiLMLayer(channels, context_dim)
+            # self.film_layer = FiLMLayer(channels, context_dim)
             self.context_bias = nn.Linear(context_dim, channels)
         else:
-            self.film_layer = None
+            # self.film_layer = None
             self.context_bias = None
         self.ffn = nn.Sequential(
             nn.Linear(channels, channels * 4),
