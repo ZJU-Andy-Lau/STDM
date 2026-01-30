@@ -35,11 +35,19 @@ class EVChargerDatasetV2(Dataset):
                 did_policy_12am_path=None,
                 did_beta_8am_path=None,
                 did_beta_12am_path=None,
-                enable_did=True):
+                enable_did=True,
+                enable_counterfactual_price=False,
+                counterfactual_price_factor=1.2,
+                counterfactual_price_indices=(11, 12),
+                counterfactual_price_hours=(8, 9)):
         self.cfg = cfg
         self.history_len = int(history_len)
         self.pred_len = int(pred_len)
         self.enable_did = bool(enable_did)
+        self.enable_counterfactual_price = bool(enable_counterfactual_price)
+        self.counterfactual_price_factor = float(counterfactual_price_factor)
+        self.counterfactual_price_indices = tuple(counterfactual_price_indices)
+        self.counterfactual_price_hours = tuple(counterfactual_price_hours)
         self.did_ready = False
         self.policy = None     # dict: keys -> (T, N)
         self.beta_8 = None     
@@ -56,11 +64,18 @@ class EVChargerDatasetV2(Dataset):
             self._load_did_resources(did_policy_8am_path, did_policy_12am_path, did_beta_8am_path, did_beta_12am_path)
             self.did_ready = True    
 
-        minmax_features = features[:, :, cfg.HISTORY_FEATURES-4:cfg.HISTORY_FEATURES+5].copy()
-        zscore_features = features[:, :, cfg.HISTORY_FEATURES+5:].copy()
+        raw_features = features.copy()
+        if self.enable_counterfactual_price:
+            if not self.did_ready:
+                raise ValueError("[counterfactual] 需要加载 DID 资源以使用 D8 掩码")
+            self._apply_counterfactual_policy_increase()
+            raw_features = self._apply_counterfactual_price_increase(raw_features)
+
+        minmax_features = raw_features[:, :, cfg.HISTORY_FEATURES-4:cfg.HISTORY_FEATURES+5].copy()
+        zscore_features = raw_features[:, :, cfg.HISTORY_FEATURES+5:].copy()
         
-        dynamic_features = features[:, :, :cfg.HISTORY_FEATURES].copy()
-        static_features = features[0, :, cfg.HISTORY_FEATURES:].copy()
+        dynamic_features = raw_features[:, :, :cfg.HISTORY_FEATURES].copy()
+        static_features = raw_features[0, :, cfg.HISTORY_FEATURES:].copy()
 
         target_col_original = dynamic_features[:, :, 0]
         y_raw = target_col_original.copy()
@@ -324,6 +339,49 @@ class EVChargerDatasetV2(Dataset):
             self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
         
         load_one_beta(did_beta_8am_path, did_beta_12am_path)
+
+    def _apply_counterfactual_policy_increase(self):
+        """
+        反事实推演：使用 D8 > 0 作为涨价区域掩码，
+        将 delta_p8 (dp8) 的涨幅放大到原来的指定倍数。
+        """
+        d8 = self.policy["D8"]
+        dp8 = self.policy["delta_p8"]
+        mask = d8 > 0
+        self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+
+    def _apply_counterfactual_price_increase(self, features):
+        """
+        反事实推演：仅在原本价格上涨的区域，将 8 点与 9 点的电价/服务价涨幅放大到原来的指定倍数。
+
+        规则：
+        1) 仅在 D8 > 0 的区域进行调整；
+        2) 8 点与 9 点均生效；
+        3) 电价和服务价分别按各自的涨幅放大。
+        """
+        original = features.copy()
+        adjusted = features.copy()
+        time_steps = adjusted.shape[0]
+        if time_steps < 2:
+            return adjusted
+
+        for t in range(1, time_steps):
+            hour = t % 24
+            if hour not in self.counterfactual_price_hours:
+                continue
+
+            day_idx = min(t // 24, self.policy["D8"].shape[0] - 1)
+            increase_mask = self.policy["D8"][day_idx] > 0
+            if not np.any(increase_mask):
+                continue
+
+            for feat_idx in self.counterfactual_price_indices:
+                prev_vals = original[t - 1, :, feat_idx]
+                curr_vals = original[t, :, feat_idx]
+                deltas = curr_vals - prev_vals
+                adjusted[t, increase_mask, feat_idx] = prev_vals[increase_mask] + deltas[increase_mask] * self.counterfactual_price_factor
+
+        return adjusted
 
     def _build_mu_future(self, start_idx):
         """
