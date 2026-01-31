@@ -39,7 +39,7 @@ class EVChargerDatasetV2(Dataset):
                 enable_counterfactual_price=False,
                 counterfactual_price_factor=1.2,
                 counterfactual_price_indices=(11, 12),
-                counterfactual_price_hours=(8, 9)):
+                counterfactual_price_hours=(12, 13)):
         self.cfg = cfg
         self.history_len = int(history_len)
         self.pred_len = int(pred_len)
@@ -342,21 +342,28 @@ class EVChargerDatasetV2(Dataset):
 
     def _apply_counterfactual_policy_increase(self):
         """
-        反事实推演：使用 D8 > 0 作为涨价区域掩码，
-        将 delta_p8 (dp8) 的涨幅放大到原来的指定倍数。
+        反事实推演：根据 counterfactual_price_hours 选择 8 点或 12 点，
+        使用 D8/D12 > 0 作为区域掩码，将对应 delta_p 放大到指定倍数。
         """
-        d8 = self.policy["D8"]
-        dp8 = self.policy["delta_p8"]
-        mask = d8 > 0
-        self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+        hours = set(self.counterfactual_price_hours)
+        if 8 in hours or 9 in hours:
+            d8 = self.policy["D8"]
+            dp8 = self.policy["delta_p8"]
+            mask = d8 > 0
+            self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+        if 12 in hours or 13 in hours:
+            d12 = self.policy["D12"]
+            dp12 = self.policy["delta_p12"]
+            mask = d12 > 0
+            self.policy["delta_p12"] = np.where(mask, dp12 * self.counterfactual_price_factor, dp12)
 
     def _apply_counterfactual_price_increase(self, features):
         """
         反事实推演：仅在原本价格上涨的区域，将 8 点与 9 点的电价/服务价涨幅放大到原来的指定倍数。
 
         规则：
-        1) 仅在 D8 > 0 的区域进行调整；
-        2) 8 点与 9 点均生效；
+        1) 在指定小时内，仅在 D8/D12 > 0 的区域进行调整；
+        2) 小时范围由 counterfactual_price_hours 决定；
         3) 电价和服务价分别按各自的涨幅放大。
         """
         original = features.copy()
@@ -371,7 +378,10 @@ class EVChargerDatasetV2(Dataset):
                 continue
 
             day_idx = min(t // 24, self.policy["D8"].shape[0] - 1)
-            increase_mask = self.policy["D8"][day_idx] > 0
+            if hour in (8, 9):
+                increase_mask = self.policy["D8"][day_idx] > 0
+            else:
+                increase_mask = self.policy["D12"][day_idx] > 0
             if not np.any(increase_mask):
                 continue
 
