@@ -229,10 +229,10 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         all_mu_raw = np.concatenate(gathered_mu, axis=0)
         all_idx = np.concatenate(gathered_idx, axis=0)
         all_future_x0 = np.concatenate(gathered_future_x0, axis=0)
-        print(f"gather index:{all_idx}")
+        # print(f"gather index:{all_idx}")
 
         order = np.argsort(all_idx)
-        print(f"order:{order}")
+        # print(f"order:{order}")
         all_predictions_norm = all_predictions_norm[order]
         all_true_norm = all_true_norm[order]
         all_samples_norm = all_samples_norm[:, order]
@@ -260,37 +260,16 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         y_samp = y_samp.squeeze(-1).transpose(1, 0, 3, 2)   # (B, S, L, N)
         y_true = all_future_x0.squeeze(-1).transpose(0, 2, 1)  # (B, L, N)
 
-        try:
-            all_baseline_preds = np.load("./urbanev/TimeXer_predictions.npy")
-            all_baseline_preds = np.concatenate([all_baseline_preds[:, :, -1:], all_baseline_preds], axis=-1)[:, :, :-1]
-            all_baseline_preds = all_baseline_preds[:y_pred.shape[0]]
-            y_true = y_true[:all_baseline_preds.shape[0]]
-            y_pred = y_pred[:all_baseline_preds.shape[0]]
-            y_samp = y_samp[:all_baseline_preds.shape[0]]
-            print("\n已加载基线模型 (TimeXer) 预测，用于 DM 显著性检验。")
-            print(f"all_baseline_preds shape:{all_baseline_preds.shape}")
-            perform_significance = True
-        except FileNotFoundError:
-            print("\n警告：基线预测文件 ./urbanev/TimeXer_predictions.npy 未找到。")
-            print("跳过 DM 显著性检验。")
-            perform_significance = False
-        
+    
         print(f"y_true shape:{y_true.shape}")
         print(f"y_pred shape:{y_pred.shape}")
         print(f"y_samp shape:{y_samp.shape}")
-        print(f"all_baseline_shape:{all_baseline_preds.shape}")
 
         np.save(f'./results/truths_{cfg.RUN_ID}_{key}.npy', y_true)
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', y_pred)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', y_samp)
 
         final_metrics = calculate_metrics(y_true, y_pred, y_samp, cfg.DEVICE)
-        if perform_significance:
-            errors_model = np.abs(y_true.flatten() - y_pred.flatten())
-            errors_baseline = np.abs(y_true.flatten() - all_baseline_preds.flatten())
-            dm_statistic, p_value = dm_test(errors_baseline, errors_model)
-            final_metrics['dm_stat'] = dm_statistic
-            final_metrics['p_value'] = p_value
             
         return final_metrics
     else:
