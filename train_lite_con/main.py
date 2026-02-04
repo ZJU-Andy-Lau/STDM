@@ -136,7 +136,7 @@ def train():
                                        )
     
     if dist.is_initialized():
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True,drop_last=True)
     else:
         train_sampler = None
 
@@ -180,7 +180,7 @@ def train():
                                     )
     
     if dist.is_initialized():
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False,drop_last=True)
     else:
         val_sampler = None
 
@@ -198,7 +198,7 @@ def train():
     val_eval_dataset = Subset(val_dataset, val_eval_indices_subset)
     
     if dist.is_initialized():
-        val_eval_sampler = DistributedSampler(val_eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_eval_sampler = DistributedSampler(val_eval_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True)
     else:
         val_eval_sampler = None
 

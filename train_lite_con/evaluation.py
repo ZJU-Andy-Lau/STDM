@@ -151,7 +151,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
                                       did_beta_12am_path=did_beta_12am_path,
                                       )
     print(f"Test dataset size: {len(test_dataset)} samples.")
-    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True)
     test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
     all_predictions_list, all_samples_list, all_true_list, all_idx_list,all_mu_list, all_future_x0_list = [], [], [], [], [], []
