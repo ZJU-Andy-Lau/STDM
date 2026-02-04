@@ -40,7 +40,6 @@ class EVChargerDatasetV2(Dataset):
                 counterfactual_price_factor=2,
                 counterfactual_price_indices=(11, 12),
                 counterfactual_price_hours=(12, 13)):
-                counterfactual_price_hours=(12, 13)):
         self.cfg = cfg
         self.history_len = int(history_len)
         self.pred_len = int(pred_len)
