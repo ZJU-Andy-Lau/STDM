@@ -37,9 +37,9 @@ class EVChargerDatasetV2(Dataset):
                 did_beta_12am_path=None,
                 enable_did=True,
                 enable_counterfactual_price=False,
-                counterfactual_price_factor=1.2,
+                counterfactual_price_factor=2,
                 counterfactual_price_indices=(11, 12),
-                counterfactual_price_hours=(8, 9)):
+                counterfactual_price_hours=(12, 13)):
         self.cfg = cfg
         self.history_len = int(history_len)
         self.pred_len = int(pred_len)
@@ -294,25 +294,25 @@ class EVChargerDatasetV2(Dataset):
             bnpz_8am = np.load(beta_path_8am, allow_pickle=True)
             bnpz_12am = np.load(beta_path_12am, allow_pickle=True)
 
-            for k in ["r_grid", "beta_own", "beta_amp", "beta_exp", "beta_tx"]:
+            for k in ["r_grid", "beta_price", "beta_exp", "beta_tx"]:
                 if k not in bnpz_8am:
                     raise KeyError(f"[DID] {beta_path_8am} 缺少键: {k}")
                 if k not in bnpz_12am:
                     raise KeyError(f"[DID] {beta_path_12am} 缺少键: {k}")
 
             r_grid_8am = bnpz_8am["r_grid"].astype(np.float32)       # (R,)
-            beta_own_8am = bnpz_8am["beta_own"].astype(np.float32)   # (R,)
-            beta_amp_8am = bnpz_8am["beta_amp"].astype(np.float32)   # (R,)
+            # beta_own_8am = bnpz_8am["beta_own"].astype(np.float32)   # (R,)
+            beta_price_8am = bnpz_8am["beta_price"].astype(np.float32)   # (R,)
             beta_exp_8am = bnpz_8am["beta_exp"].astype(np.float32)   # (R,)
             beta_tx_8am  = bnpz_8am["beta_tx"].astype(np.float32)    # (R,)
 
             r_grid_12am = bnpz_12am["r_grid"].astype(np.float32)       # (R,)
-            beta_own_12am = bnpz_12am["beta_own"].astype(np.float32)   # (R,)
-            beta_amp_12am = bnpz_12am["beta_amp"].astype(np.float32)   # (R,)
+            # beta_own_12am = bnpz_12am["beta_own"].astype(np.float32)   # (R,)
+            beta_price_12am = bnpz_12am["beta_price"].astype(np.float32)   # (R,)
             beta_exp_12am = bnpz_12am["beta_exp"].astype(np.float32)   # (R,)
             beta_tx_12am  = bnpz_12am["beta_tx"].astype(np.float32)    # (R,)
 
-            def build_hourly_beta_from_5min(r_grid, beta_own, beta_amp, beta_exp, beta_tx, hour_bins):
+            def build_hourly_beta_from_5min(r_grid, beta_price, beta_exp, beta_tx, hour_bins):
                 beta_dict = {}
                 for h in hour_bins:
                     left  = h * 60
@@ -325,63 +325,94 @@ class EVChargerDatasetV2(Dataset):
                         )
 
                     beta_dict[h] = np.array([
-                        beta_own[mask].mean(),
-                        beta_amp[mask].mean(),
+                        beta_price[mask].mean(),
                         beta_exp[mask].mean(),
                         beta_tx[mask].mean(),
                     ], dtype=np.float32)
 
                 return beta_dict
 
-            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_own_8am, beta_amp_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0, 1]
+            self.beta_8 = build_hourly_beta_from_5min(r_grid_8am, beta_price_8am, beta_exp_8am, beta_tx_8am, hour_bins=[-3,-2, -1, 0, 1]
             )
 
-            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_own_12am, beta_amp_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
+            self.beta_12 = build_hourly_beta_from_5min(r_grid_12am, beta_price_12am, beta_exp_12am, beta_tx_12am, hour_bins=[0, 1])
         
         load_one_beta(did_beta_8am_path, did_beta_12am_path)
 
     def _apply_counterfactual_policy_increase(self):
         """
-        反事实推演：使用 D8 > 0 作为涨价区域掩码，
-        将 delta_p8 (dp8) 的涨幅放大到原来的指定倍数。
+        反事实推演：根据 counterfactual_price_hours 选择 8 点或 12 点，
+        使用 D8/D12 > 0 作为区域掩码，将对应 delta_p 放大到指定倍数。
         """
-        d8 = self.policy["D8"]
-        dp8 = self.policy["delta_p8"]
-        mask = d8 > 0
-        self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+        hours = set(self.counterfactual_price_hours)
+        if 8 in hours:
+            d8 = self.policy["D8"]
+            dp8 = self.policy["delta_p8"]
+            mask = d8 > 0
+            self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+            print("dp8:",dp8.sum())
+        if 12 in hours:
+            d12 = self.policy["D12"]
+            dp12 = self.policy["delta_p12"]
+            mask = d12 > 0
+            self.policy["delta_p12"] = np.where(mask, dp12 * self.counterfactual_price_factor, dp12)
 
     def _apply_counterfactual_price_increase(self, features):
-        """
-        反事实推演：仅在原本价格上涨的区域，将 8 点与 9 点的电价/服务价涨幅放大到原来的指定倍数。
-
-        规则：
-        1) 仅在 D8 > 0 的区域进行调整；
-        2) 8 点与 9 点均生效；
-        3) 电价和服务价分别按各自的涨幅放大。
-        """
         original = features.copy()
         adjusted = features.copy()
         time_steps = adjusted.shape[0]
         if time_steps < 2:
             return adjusted
 
+        hours = set(self.counterfactual_price_hours)
+        # 事件小时：只可能是 8 或 12（如果用户没在 hours 里给，就不处理）
+        event_hours = hours & {8, 12}
+        # 跟随小时：只可能是 9 或 13（如果用户没在 hours 里给，就不处理）
+        hold_hours = hours & {9, 13}
+
+
         for t in range(1, time_steps):
             hour = t % 24
-            if hour not in self.counterfactual_price_hours:
+            if hour not in (event_hours | hold_hours):
                 continue
 
             day_idx = min(t // 24, self.policy["D8"].shape[0] - 1)
-            increase_mask = self.policy["D8"][day_idx] > 0
-            if not np.any(increase_mask):
-                continue
 
-            for feat_idx in self.counterfactual_price_indices:
-                prev_vals = original[t - 1, :, feat_idx]
-                curr_vals = original[t, :, feat_idx]
-                deltas = curr_vals - prev_vals
-                adjusted[t, increase_mask, feat_idx] = prev_vals[increase_mask] + deltas[increase_mask] * self.counterfactual_price_factor
+            # ========== 8/12 点：变价事件，幅度放大（可涨可跌） ==========
+            if hour in event_hours:
+                if hour == 8:
+                    treated = self.policy["D8"][day_idx] > 0
+                else:  # hour == 12
+                    treated = self.policy["D12"][day_idx] > 0
+
+                if not np.any(treated):
+                    continue
+
+                for feat_idx in self.counterfactual_price_indices:
+                    prev_vals = original[t - 1, :, feat_idx]
+                    curr_vals = original[t, :, feat_idx]
+                    deltas = curr_vals - prev_vals
+
+                    # 只在变价区域放大“事件变动幅度”（保留涨/跌符号）
+                    adjusted[t, treated, feat_idx] = (
+                        prev_vals[treated] + deltas[treated] * self.counterfactual_price_factor
+                    )
+
+            # ========== 9/13 点：不再变价，保持与“变价后”的 8/12 点一致 ==========
+            else:
+                if hour == 9:
+                    treated = self.policy["D8"][day_idx] > 0
+                else:  # hour == 13
+                    treated = self.policy["D12"][day_idx] > 0
+
+                if not np.any(treated):
+                    continue
+
+                for feat_idx in self.counterfactual_price_indices:
+                    adjusted[t, treated, feat_idx] = adjusted[t - 1, treated, feat_idx]
 
         return adjusted
+
 
     def _build_mu_future(self, start_idx):
         """
@@ -392,7 +423,7 @@ class EVChargerDatasetV2(Dataset):
         Lf = self.pred_len
         N = self.cfg.NUM_NODES
         mu = np.zeros((Lf, N, self.cfg.TARGET_FEAT_DIM), dtype=np.float32)
-        mu_comps = np.zeros((Lf, N, 5), dtype=np.float32)
+        mu_comps = np.zeros((Lf, N, 4), dtype=np.float32)
 
         if not (self.enable_did and self.did_ready):
             return mu, mu_comps
@@ -424,34 +455,30 @@ class EVChargerDatasetV2(Dataset):
             r8 = rel8[k]
             if r8 in self.beta_8:
                 b = self.beta_8[r8]
-                
-                term_own = b[0] * D8 * PSM8
-                term_amp = b[1] * D8 * dp8 * PSM8
-                term_ec  = b[2] * ec8 * PSM8
-                term_tc  = b[3] * tc8 * PSM8
-                
-                mu_comps[k, :, 0] += term_own
-                mu_comps[k, :, 1] += term_amp
-                mu_comps[k, :, 2] += term_ec
-                mu_comps[k, :, 3] += term_tc
-                mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
+    
+                term_price = b[0] * D8 * dp8 * PSM8
+                term_ec  = b[1] * ec8 * PSM8
+                term_tc  = b[2] * tc8 * PSM8
+
+                mu_comps[k, :, 0] += term_price
+                mu_comps[k, :, 1] += term_ec
+                mu_comps[k, :, 2] += term_tc
+                mu_comps[k, :, 3] += (term_price + term_ec + term_tc)
 
             r12 = rel12[k]
             if r12 in self.beta_12:
                 b = self.beta_12[r12]
                 
-                term_own = b[0] * D12 * PSM12
-                term_amp = b[1] * D12 * dp12 * PSM12
-                term_ec  = b[2] * ec12 * PSM12
-                term_tc  = b[3] * tc12 * PSM12
-                
-                mu_comps[k, :, 0] += term_own
-                mu_comps[k, :, 1] += term_amp
-                mu_comps[k, :, 2] += term_ec
-                mu_comps[k, :, 3] += term_tc
-                mu_comps[k, :, 4] += (term_own + term_amp + term_ec + term_tc)
-        
-        mu[:, :, 0] = mu_comps[:, :, 4]
+                term_price = b[0] * D12 * dp12 * PSM12
+                term_ec  = b[1] * ec12 * PSM12
+                term_tc  = b[2] * tc12 * PSM12
+
+                mu_comps[k, :, 0] += term_price
+                mu_comps[k, :, 1] += term_ec
+                mu_comps[k, :, 2] += term_tc
+                mu_comps[k, :, 3] += (term_price + term_ec + term_tc)
+
+        mu[:, :, 0] = mu_comps[:, :, 3]
         # print(f"mu:\n{mu}\nmu_comps:\n{mu_comps}")
         return mu, mu_comps
 
