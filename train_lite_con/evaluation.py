@@ -229,10 +229,10 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         all_mu_raw = np.concatenate(gathered_mu, axis=0)
         all_idx = np.concatenate(gathered_idx, axis=0)
         all_future_x0 = np.concatenate(gathered_future_x0, axis=0)
-        print(f"gather index:{all_idx}")
+        # print(f"gather index:{all_idx}")
 
         order = np.argsort(all_idx)
-        print(f"order:{order}")
+        # print(f"order:{order}")
         all_predictions_norm = all_predictions_norm[order]
         all_true_norm = all_true_norm[order]
         all_samples_norm = all_samples_norm[:, order]

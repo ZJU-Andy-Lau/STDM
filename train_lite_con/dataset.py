@@ -40,6 +40,7 @@ class EVChargerDatasetV2(Dataset):
                 counterfactual_price_factor=2,
                 counterfactual_price_indices=(11, 12),
                 counterfactual_price_hours=(12, 13)):
+                counterfactual_price_hours=(12, 13)):
         self.cfg = cfg
         self.history_len = int(history_len)
         self.pred_len = int(pred_len)
@@ -341,6 +342,8 @@ class EVChargerDatasetV2(Dataset):
 
     def _apply_counterfactual_policy_increase(self):
         """
+        反事实推演：根据 counterfactual_price_hours 选择 8 点或 12 点，
+        使用 D8/D12 > 0 作为区域掩码，将对应 delta_p 放大到指定倍数。
         反事实推演：根据 counterfactual_price_hours 选择 8 点或 12 点，
         使用 D8/D12 > 0 作为区域掩码，将对应 delta_p 放大到指定倍数。
         """
