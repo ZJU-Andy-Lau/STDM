@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 from tqdm import tqdm
-from datetime import datetime
+from datetime import datetime,timedelta
 from torch.cuda import amp
 from contextlib import nullcontext
 import joblib
@@ -47,7 +47,10 @@ def train():
     # --- DDP 初始化 ---
     # 检查是否在 DDP 环境中
     if "RANK" in os.environ:
-        dist.init_process_group("nccl")
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(days=1),
+        )
         rank = int(os.environ["RANK"])
         device_id = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
