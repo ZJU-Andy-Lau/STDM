@@ -6,3 +6,6 @@ urbanev/
 *.json
 *.sh
 *.npy
+*.csv
+*.log
+*.ipynb
