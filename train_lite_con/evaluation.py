@@ -100,11 +100,13 @@ def periodic_evaluate_mae(model, loader, scaler_e, adj_tensor, cfg, device):
     model.train() 
     return np.concatenate(all_predictions_list, axis=0).squeeze(-1).transpose(0, 2, 1), np.concatenate(all_true_list, axis=0).squeeze(-1).transpose(0, 2, 1)
 
-def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm_path, scaler_z_path, device, rank, world_size,key):
+def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm_path, scaler_z_path, device, rank, world_size,key,sampling_steps=None):
     cfg = EvalConfig()
     cfg.RUN_ID = train_cfg.RUN_ID
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
     cfg.DEVICE = device
+    if sampling_steps is not None:
+        cfg.SAMPLING_STEPS = sampling_steps
 
     # 初始化模型时传入 MAX_CHANNELS
     model = SpatioTemporalDiffusionModelV2(

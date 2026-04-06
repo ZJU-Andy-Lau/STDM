@@ -37,7 +37,7 @@ class EVChargerDatasetV2(Dataset):
                 did_beta_12am_path=None,
                 enable_did=True,
                 enable_counterfactual_price=False,
-                counterfactual_price_factor=2,
+                counterfactual_price_delta=-0.2,
                 counterfactual_price_indices=(11, 12),
                 counterfactual_price_hours=(12, 13)):
         self.cfg = cfg
@@ -45,7 +45,7 @@ class EVChargerDatasetV2(Dataset):
         self.pred_len = int(pred_len)
         self.enable_did = bool(enable_did)
         self.enable_counterfactual_price = bool(enable_counterfactual_price)
-        self.counterfactual_price_factor = float(counterfactual_price_factor)
+        self.counterfactual_price_delta = float(counterfactual_price_delta)
         self.counterfactual_price_indices = tuple(counterfactual_price_indices)
         self.counterfactual_price_hours = tuple(counterfactual_price_hours)
         self.did_ready = False
@@ -347,17 +347,18 @@ class EVChargerDatasetV2(Dataset):
         使用 D8/D12 > 0 作为区域掩码，将对应 delta_p 放大到指定倍数。
         """
         hours = set(self.counterfactual_price_hours)
+        delta = self.counterfactual_price_delta
         if 8 in hours:
             d8 = self.policy["D8"]
             dp8 = self.policy["delta_p8"]
             mask = d8 > 0
-            self.policy["delta_p8"] = np.where(mask, dp8 * self.counterfactual_price_factor, dp8)
+            self.policy["delta_p8"] = np.where(mask, dp8 + delta, dp8)
             print("dp8:",dp8.sum())
         if 12 in hours:
             d12 = self.policy["D12"]
             dp12 = self.policy["delta_p12"]
             mask = d12 > 0
-            self.policy["delta_p12"] = np.where(mask, dp12 * self.counterfactual_price_factor, dp12)
+            self.policy["delta_p12"] = np.where(mask, dp12 + delta, dp12)
 
     def _apply_counterfactual_price_increase(self, features):
         original = features.copy()
@@ -389,16 +390,12 @@ class EVChargerDatasetV2(Dataset):
 
                 if not np.any(treated):
                     continue
-
+                
+                delta = self.counterfactual_price_delta
                 for feat_idx in self.counterfactual_price_indices:
-                    prev_vals = original[t - 1, :, feat_idx]
                     curr_vals = original[t, :, feat_idx]
-                    deltas = curr_vals - prev_vals
-
-                    # 只在变价区域放大“事件变动幅度”（保留涨/跌符号）
-                    adjusted[t, treated, feat_idx] = (
-                        prev_vals[treated] + deltas[treated] * self.counterfactual_price_factor
-                    )
+                    # 只在 treated 区域做 +delta（保留正负号表达涨/跌）
+                    adjusted[t, treated, feat_idx] = curr_vals[treated] + delta
 
             # ========== 9/13 点：不再变价，保持与“变价后”的 8/12 点一致 ==========
             else:

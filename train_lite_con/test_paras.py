@@ -83,67 +83,52 @@ def main():
             return
 
     # 定义要测试的模型列表
-    models_to_test = [
-        {
+    model_info = {
             "name": "Best Val MAE Model",
             "key": "best",
             "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="mae_best")
-        },
-        {
-            "name": "2nd Best Val MAE Model",
-            "key": "second_best",
-            "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="mae_second_best")
-        },
-        {
-            "name": "Best Val Loss Model",
-            "key": "best_val",
-            "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="best")
-        },
-        #  {
-        #     "name": "2nd Best Val Loss Model",
-        #     "key": "second_best_val",
-        #     "path": cfg.MODEL_SAVE_PATH_TEMPLATE.format(run_id=target_run_id, rank="second_best")
-        # },
-        
-    ]
+        }
+    
+    # 进行 Diffusion steps 参数敏感性分析
+    sampling_steps_list = [15]
 
     # --- 7. 循环评估 ---
     # 使用 broadcast 确保所有进程同步模型列表 (虽然这里是硬编码的，但为了 DDP 规范)
     dist.barrier()
 
-    for model_info in models_to_test:
-        model_path = model_info["path"]
-        model_name = model_info["name"]
-        model_key = model_info["key"]
+    model_path = model_info["path"]
+    model_name = model_info["name"]
+    model_key = model_info["key"]
 
-        # 检查文件是否存在
-        file_exists = os.path.exists(model_path)
-        
-        if file_exists:
-            if rank == 0:
-                print(f"\n>>> 正在评估: {model_name}")
-                print(f"    路径: {model_path}")
-            
-            # 调用现有的评估函数
-            metrics = evaluate_model(
-                train_cfg=cfg,
-                model_path=model_path,
-                scaler_y_path=scaler_y_path,
-                scaler_e_path=scaler_e_path,
-                scaler_mm_path=scaler_mm_path,
-                scaler_z_path=scaler_z_path,
-                device=f"cuda:{device_id}",
-                rank=rank,
-                world_size=world_size,
-                key=model_key+'_post_test'
-            )
+    if not os.path.exists(model_path):
+        if rank == 0:
+            print(f"\n[跳过] 未找到模型文件: {model_name} ({model_path})")
+        dist.destroy_process_group()
+        return
 
-            if rank == 0 and metrics:
-                print(f"--- {model_name} 结果 ---")
-                print_metrics(metrics)
-        else:
-            if rank == 0:
-                print(f"\n[跳过] 未找到模型文件: {model_name} ({model_path})")
+    for sampling_steps in sampling_steps_list:
+        cfg.SAMPLING_STEPS = sampling_steps
+        if rank == 0:
+            print(f"\n>>> 正在评估: {model_name} | SAMPLING_STEPS={sampling_steps}")
+            print(f"    路径: {model_path}")
+
+        metrics = evaluate_model(
+            train_cfg=cfg,
+            model_path=model_path,
+            scaler_y_path=scaler_y_path,
+            scaler_e_path=scaler_e_path,
+            scaler_mm_path=scaler_mm_path,
+            scaler_z_path=scaler_z_path,
+            device=f"cuda:{device_id}",
+            rank=rank,
+            world_size=world_size,
+            key=f"{model_key}_steps{sampling_steps}_post_test",
+            sampling_steps=sampling_steps
+        )
+
+        if rank == 0 and metrics:
+            print(f"--- {model_name} | steps={sampling_steps} 结果 ---")
+            print_metrics(metrics)
         
         # 确保所有进程同步进入下一个模型
         dist.barrier()
