@@ -105,7 +105,8 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
     cfg.RUN_ID = train_cfg.RUN_ID
     cfg.NORMALIZATION_TYPE = train_cfg.NORMALIZATION_TYPE
     cfg.DEVICE = device
-    cfg.SAMPLING_STEPS = sampling_steps if sampling_steps is not None else train_cfg.SAMPLING_STEPS
+    if sampling_steps is not None:
+        cfg.SAMPLING_STEPS = sampling_steps
 
     # 初始化模型时传入 MAX_CHANNELS
     model = SpatioTemporalDiffusionModelV2(
@@ -152,7 +153,7 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
                                       did_beta_12am_path=did_beta_12am_path,
                                       )
     print(f"Test dataset size: {len(test_dataset)} samples.")
-    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True)
     test_dataloader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, sampler=test_sampler)
     
     all_predictions_list, all_samples_list, all_true_list, all_idx_list,all_mu_list, all_future_x0_list = [], [], [], [], [], []
@@ -260,18 +261,22 @@ def evaluate_model(train_cfg, model_path, scaler_y_path, scaler_e_path,scaler_mm
         # y_true = y_true.squeeze(-1).transpose(0, 2, 1)      # (B, L, N)
         y_samp = y_samp.squeeze(-1).transpose(1, 0, 3, 2)   # (B, S, L, N)
         y_true = all_future_x0.squeeze(-1).transpose(0, 2, 1)  # (B, L, N)
-        
+        mu_save = all_mu_raw.squeeze(-1).transpose(0, 2, 1) # (B, L, N)
+        e_save = e_pred.squeeze(-1).transpose(0, 2, 1)      # (B, L, N)
+
+
         print(f"y_true shape:{y_true.shape}")
         print(f"y_pred shape:{y_pred.shape}")
         print(f"y_samp shape:{y_samp.shape}")
-  
+
 
         np.save(f'./results/truths_{cfg.RUN_ID}_{key}.npy', y_true)
         np.save(f'./results/pred_{cfg.RUN_ID}_{key}.npy', y_pred)
         np.save(f'./results/samples_{cfg.RUN_ID}_{key}.npy', y_samp)
+        np.save(f'./results/mu_{cfg.RUN_ID}_{key}.npy', mu_save)
+        np.save(f'./results/e_{cfg.RUN_ID}_{key}.npy', e_save)
 
         final_metrics = calculate_metrics(y_true, y_pred, y_samp, cfg.DEVICE)
-
             
         return final_metrics
     else:

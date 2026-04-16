@@ -76,7 +76,7 @@ class ConfigV2:
     EVAL_ON_VAL_BATCHES = 48         
     EVAL_ON_VAL_SAMPLES = 10          
     EVAL_ON_VAL_STEPS = 20           
-    SAMPLING_ETA = 0.0               
+    SAMPLING_ETA = 0.2               
     EVAL_SEED = 42 
 
     TRAIN_FEATURES_PATH = './urbanev/features_train_wea_poi.npy'
@@ -94,7 +94,7 @@ class ConfigV2:
     
 
 class EvalConfig(ConfigV2):
-    BATCH_SIZE = 8
+    BATCH_SIZE = 4
     NUM_SAMPLES = 20
     SAMPLING_STEPS = 50
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
